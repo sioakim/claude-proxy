@@ -30,8 +30,18 @@ for (const p of credsPaths) {
 }
 
 if (!credsPath) {
-  console.error('   NOT FOUND. Run "claude auth login" first.');
-  console.error('   Searched:', credsPaths.join(', '));
+  console.error('   NOT FOUND.');
+  console.error('');
+  console.error('   Claude Code CLI must be installed and authenticated first:');
+  console.error('');
+  console.error('     npm install -g @anthropic-ai/claude-code');
+  console.error('     claude auth login');
+  console.error('');
+  console.error('   This opens a browser to sign in with your Claude Max/Pro account.');
+  console.error('   After authenticating, run this setup script again.');
+  console.error('');
+  console.error('   Searched for credentials at:');
+  for (const p of credsPaths) { console.error('     ' + p); }
   process.exit(1);
 }
 
