@@ -164,12 +164,44 @@ function loadConfig() {
 }
 
 // ─── Token Management ───────────────────────────────────────────────────────
+function refreshFromKeychain(credsPath) {
+  if (process.platform !== 'darwin') return null;
+  const { execSync } = require('child_process');
+  const keychainNames = ['Claude Code-credentials', 'claude-code', 'claude', 'com.anthropic.claude-code'];
+  for (const svc of keychainNames) {
+    try {
+      const token = execSync('security find-generic-password -s "' + svc + '" -w 2>/dev/null', { encoding: 'utf8' }).trim();
+      if (!token) continue;
+      let creds;
+      try { creds = JSON.parse(token); } catch(e) {
+        if (token.startsWith('sk-ant-')) {
+          creds = { claudeAiOauth: { accessToken: token, expiresAt: Date.now() + 86400000, subscriptionType: 'unknown' } };
+        }
+      }
+      if (creds && creds.claudeAiOauth && creds.claudeAiOauth.expiresAt > Date.now()) {
+        fs.writeFileSync(credsPath, JSON.stringify(creds));
+        return creds.claudeAiOauth;
+      }
+    } catch(e) { /* not found */ }
+  }
+  return null;
+}
+
 function getToken(credsPath) {
   const raw = fs.readFileSync(credsPath, 'utf8');
   const creds = JSON.parse(raw);
   const oauth = creds.claudeAiOauth;
   if (!oauth || !oauth.accessToken) {
     throw new Error('No OAuth token in credentials file. Run "claude auth login".');
+  }
+  // If token is expired or expiring within 5 minutes, try Keychain refresh (macOS)
+  if (oauth.expiresAt && oauth.expiresAt < Date.now() + 300000) {
+    const refreshed = refreshFromKeychain(credsPath);
+    if (refreshed) return refreshed;
+    // On non-macOS, or if Keychain had no fresh token, warn but return stale token
+    // so the caller gets a clear 401 from the API rather than a cryptic local error
+    const expiredAgo = ((Date.now() - oauth.expiresAt) / 60000).toFixed(0);
+    console.error(`[PROXY] Token expired ${expiredAgo}m ago. Run "claude auth login" to refresh.`);
   }
   return oauth;
 }
