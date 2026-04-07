@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Troubleshoot script for OpenClaw Billing Proxy
+ * Troubleshoot script for Claude Proxy
  *
  * Runs diagnostic checks to identify why the proxy isn't working.
  * Tests each layer independently: credentials, token, billing header,

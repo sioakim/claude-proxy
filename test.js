@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Comprehensive BDD-style tests for openclaw-billing-proxy.
+ * Comprehensive BDD-style tests for claude-proxy.
  *
  * Covers:
  *   - SSE token extraction (batch + incremental tracker)

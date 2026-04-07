@@ -1,4 +1,6 @@
-# OpenClaw Subscription Billing Proxy
+# Claude Proxy
+
+> A standalone fork of [openclaw-billing-proxy](https://github.com/zacdcook/openclaw-billing-proxy) — original work credited under the MIT License. See [LICENSE](LICENSE).
 
 Route your OpenClaw API requests through your Claude Max/Pro subscription instead of Extra Usage billing.
 
@@ -54,8 +56,8 @@ claude auth status
 
 ```bash
 # 1. Clone
-git clone https://github.com/zacdcook/openclaw-billing-proxy
-cd openclaw-billing-proxy
+git clone https://github.com/sioakim/claude-proxy
+cd claude-proxy
 
 # 2. Run setup (auto-detects your config)
 node setup.js
@@ -131,9 +133,9 @@ If you have a custom assistant name that Anthropic blocks (test by checking if r
 
 ### Linux (systemd)
 ```bash
-sudo tee /etc/systemd/system/openclaw-proxy.service << EOF
+sudo tee /etc/systemd/system/claude-proxy.service << EOF
 [Unit]
-Description=OpenClaw Billing Proxy
+Description=Claude Proxy
 After=network.target
 
 [Service]
@@ -145,8 +147,8 @@ User=YOUR_USER
 WantedBy=multi-user.target
 EOF
 
-sudo systemctl enable openclaw-proxy
-sudo systemctl start openclaw-proxy
+sudo systemctl enable claude-proxy
+sudo systemctl start claude-proxy
 ```
 
 ### Windows (startup)
@@ -158,7 +160,7 @@ timeout /t 2 /nobreak >nul
 
 ### PM2
 ```bash
-pm2 start proxy.js --name openclaw-proxy
+pm2 start proxy.js --name claude-proxy
 pm2 save
 ```
 
@@ -167,7 +169,7 @@ pm2 save
 When running in a terminal, the proxy displays a real-time dashboard:
 
 ```
-  OpenClaw Billing Proxy        Port: 18801   Uptime: 2h 14m
+  Claude Proxy                  Port: 18801   Uptime: 2h 14m
   Sub: max            Token: 4.2h remaining
   Rate: [████████████░░░░░░░░] 62%  49,500 / 80,000 remaining  resets 14:32:00
   ──────────────────────────────────────────────────────────────────

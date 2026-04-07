@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * OpenClaw Subscription Billing Proxy
+ * Claude Proxy
  *
  * Routes OpenClaw API requests through Claude Code's subscription billing
  * instead of Extra Usage, by injecting Claude Code's billing identifier
@@ -164,7 +164,9 @@ function loadConfig() {
 }
 
 // ─── Token Management ───────────────────────────────────────────────────────
-function refreshFromKeychain(credsPath) {
+// Read the raw Keychain entry and return the parsed oauth object, or null.
+// Does NOT touch the credentials file — read-only probe.
+function readKeychainToken() {
   if (process.platform !== 'darwin') return null;
   const { execSync } = require('child_process');
   const keychainNames = ['Claude Code-credentials', 'claude-code', 'claude', 'com.anthropic.claude-code'];
@@ -178,13 +180,42 @@ function refreshFromKeychain(credsPath) {
           creds = { claudeAiOauth: { accessToken: token, expiresAt: Date.now() + 86400000, subscriptionType: 'unknown' } };
         }
       }
-      if (creds && creds.claudeAiOauth && creds.claudeAiOauth.expiresAt > Date.now()) {
-        fs.writeFileSync(credsPath, JSON.stringify(creds));
-        return creds.claudeAiOauth;
+      if (creds && creds.claudeAiOauth && creds.claudeAiOauth.accessToken) {
+        return creds;
       }
-    } catch(e) { /* not found */ }
+    } catch(e) { /* not found or access denied */ }
   }
   return null;
+}
+
+// Lazy refresh: called by getToken when the file token is expired.
+// Writes Keychain token to file if it's valid (future expiry).
+function refreshFromKeychain(credsPath) {
+  const creds = readKeychainToken();
+  if (!creds || creds.claudeAiOauth.expiresAt <= Date.now()) return null;
+  fs.writeFileSync(credsPath, JSON.stringify(creds));
+  return creds.claudeAiOauth;
+}
+
+// Proactive refresh: compares Keychain against file; if Keychain has a
+// strictly newer token, updates the file. Returns { updated, reason }.
+function proactiveKeychainSync(credsPath) {
+  const kc = readKeychainToken();
+  if (!kc) return { updated: false, reason: 'keychain_unavailable' };
+  const kcExp = kc.claudeAiOauth.expiresAt || 0;
+  if (kcExp <= Date.now()) return { updated: false, reason: 'keychain_token_expired' };
+
+  let fileExp = 0;
+  try {
+    const fileCreds = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+    fileExp = (fileCreds.claudeAiOauth && fileCreds.claudeAiOauth.expiresAt) || 0;
+  } catch(e) { /* file missing or corrupt — treat as stale */ }
+
+  if (kcExp > fileExp) {
+    fs.writeFileSync(credsPath, JSON.stringify(kc));
+    return { updated: true, reason: 'keychain_newer', newExpiresAt: kcExp };
+  }
+  return { updated: false, reason: 'file_up_to_date' };
 }
 
 function getToken(credsPath) {
@@ -388,7 +419,7 @@ const dashboard = {
     if (!this.isTTY) {
       // Non-TTY fallback: plain text banner
       const h = ((oauth.expiresAt - Date.now()) / 3600000).toFixed(1);
-      console.log(`\n  OpenClaw Billing Proxy`);
+      console.log(`\n  Claude Proxy`);
       console.log(`  Port: ${config.port}  Sub: ${oauth.subscriptionType}  Token: ${h}h`);
       console.log(`  Ready. Set openclaw.json baseUrl to http://127.0.0.1:${config.port}\n`);
       return;
@@ -479,7 +510,7 @@ const dashboard = {
     const tokenStr = `Token: ${h}h remaining`;
 
     process.stdout.write(ANSI.moveTo(1, 1) + ANSI.clearLine);
-    process.stdout.write(`  ${ANSI.bold}${ANSI.cyan}OpenClaw Billing Proxy${ANSI.reset}        Port: ${this.config.port}   Uptime: ${upStr}`);
+    process.stdout.write(`  ${ANSI.bold}${ANSI.cyan}Claude Proxy${ANSI.reset}                  Port: ${this.config.port}   Uptime: ${upStr}`);
     process.stdout.write(ANSI.moveTo(2, 1) + ANSI.clearLine);
     process.stdout.write(`  Sub: ${this._oauth.subscriptionType || 'unknown'}            ${tokenStr}`);
   },
@@ -664,7 +695,7 @@ function startServer(config) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           status: expiresIn > 0 ? 'ok' : 'token_expired',
-          proxy: 'openclaw-billing-proxy',
+          proxy: 'claude-proxy',
           requestsServed: requestCount,
           uptime: Math.floor((Date.now() - dashboard.startedAt) / 1000) + 's',
           tokenExpiresInHours: expiresIn.toFixed(1),
@@ -800,6 +831,34 @@ function startServer(config) {
   });
 
   server.listen(config.port, '127.0.0.1', () => {
+    // Startup Keychain health check + initial proactive sync (macOS only)
+    if (process.platform === 'darwin') {
+      const kc = readKeychainToken();
+      if (!kc) {
+        console.error('[PROXY] WARNING: macOS Keychain not readable. Automatic token refresh disabled.');
+        console.error('[PROXY]   If prompted by macOS, choose "Always Allow" for "security" to access "Claude Code-credentials".');
+        console.error('[PROXY]   You can pre-authorize by running: security find-generic-password -s "Claude Code-credentials" -w');
+      } else {
+        const result = proactiveKeychainSync(config.credsPath);
+        if (result.updated) {
+          const h = ((result.newExpiresAt - Date.now()) / 3600000).toFixed(1);
+          console.error(`[PROXY] Keychain sync: refreshed token from Keychain (${h}h remaining).`);
+        }
+      }
+      // Periodic proactive refresh every 5 minutes — picks up Claude Code's
+      // background token refreshes before the file token expires.
+      serverRefreshInterval = setInterval(() => {
+        try {
+          const r = proactiveKeychainSync(config.credsPath);
+          if (r.updated && dashboard.isTTY === false) {
+            const h = ((r.newExpiresAt - Date.now()) / 3600000).toFixed(1);
+            console.log(`[PROXY] Token auto-refreshed from Keychain (${h}h remaining)`);
+          }
+        } catch(e) { /* silent */ }
+      }, 5 * 60 * 1000);
+      if (serverRefreshInterval.unref) serverRefreshInterval.unref();
+    }
+
     try {
       const oauth = getToken(config.credsPath);
       dashboard.init(config, oauth);
@@ -808,9 +867,17 @@ function startServer(config) {
     }
   });
 
-  process.on('SIGINT', () => { dashboard.shutdown(); process.exit(0); });
-  process.on('SIGTERM', () => { dashboard.shutdown(); process.exit(0); });
+  process.on('SIGINT', () => {
+    if (serverRefreshInterval) clearInterval(serverRefreshInterval);
+    dashboard.shutdown(); process.exit(0);
+  });
+  process.on('SIGTERM', () => {
+    if (serverRefreshInterval) clearInterval(serverRefreshInterval);
+    dashboard.shutdown(); process.exit(0);
+  });
 }
+
+let serverRefreshInterval = null;
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 if (require.main === module) {
@@ -826,6 +893,9 @@ module.exports = {
   reverseMap,
   createStreamReverser,
   maxPatternLen,
+  readKeychainToken,
+  refreshFromKeychain,
+  proactiveKeychainSync,
   getToken,
   loadUsageData,
   saveUsageData,
