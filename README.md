@@ -170,19 +170,23 @@ When running in a terminal, the proxy displays a real-time dashboard:
 
 ```
   Claude Proxy                  Port: 18801   Uptime: 2h 14m
-  Sub: max            Token: 4.2h remaining
-  Rate: [████████████░░░░░░░░] 62%  49,500 / 80,000 remaining  resets 14:32:00
+  Sub: max            Token: 7.7h remaining
+  5h [██████░░░░░░░░░] 40% 1h30m    7d [███░░░░░░░░░░░░] 20% 4d12h
   ──────────────────────────────────────────────────────────────────
-                                   Input        Output
-  Today (2026-04-06)              154,320        48,210   (37)
-  Yesterday                       210,500        61,000   (52)
+                                       Input        Output
+  Today (2026-04-07)                     100         8,220   (46)
+  Yesterday                          283,094       211,779   (880)
   ──────────────────────────────────────────────────────────────────
+  Total (2d)                         283,194       219,999   (926)
+
   RECENT ACTIVITY
-  S [14:32:07] #37 POST /v1/messages 200  ↑1,204  ↓389
-  O [14:31:55] #36 POST /v1/messages 200  ↑980    ↓201
+  S [14:32:07] #37 POST /v1/messages 200   ↑1,204    ↓389
+  O [14:31:55] #36 POST /v1/messages 200     ↑980    ↓201
+
+  [i] info  [q] quit
 ```
 
-- **Rate bar** -- API rate window utilization from response headers (green/yellow/red)
+- **Rate bars** -- 5h and 7d unified rate window utilization from response headers (green <50%, yellow 50–80%, red >80%) with countdown until each window resets
 - **Token table** -- Daily input/output token totals with up to 7 days of history
 - **Recent activity** -- Last 10 requests with model tag (S/H/O = Sonnet/Haiku/Opus), status, and token counts (↑ in, ↓ out)
 
