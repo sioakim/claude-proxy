@@ -119,27 +119,12 @@ function loadConfig() {
 
   // macOS Keychain fallback: extract token and write to file
   if (!credsPath && process.platform === 'darwin') {
-    const { execSync } = require('child_process');
-    const keychainNames = ['Claude Code-credentials', 'claude-code', 'claude', 'com.anthropic.claude-code'];
-    for (const svc of keychainNames) {
-      try {
-        const token = execSync('security find-generic-password -s "' + svc + '" -w 2>/dev/null', { encoding: 'utf8' }).trim();
-        if (token) {
-          let creds;
-          try { creds = JSON.parse(token); } catch(e) {
-            if (token.startsWith('sk-ant-')) {
-              creds = { claudeAiOauth: { accessToken: token, expiresAt: Date.now() + 86400000, subscriptionType: 'unknown' } };
-            }
-          }
-          if (creds && creds.claudeAiOauth) {
-            credsPath = path.join(homeDir, '.claude', '.credentials.json');
-            fs.mkdirSync(path.join(homeDir, '.claude'), { recursive: true });
-            fs.writeFileSync(credsPath, JSON.stringify(creds));
-            console.log('[PROXY] Extracted credentials from macOS Keychain to ' + credsPath);
-            break;
-          }
-        }
-      } catch(e) { /* not found */ }
+    const creds = readKeychainToken();
+    if (creds) {
+      credsPath = path.join(homeDir, '.claude', '.credentials.json');
+      fs.mkdirSync(path.join(homeDir, '.claude'), { recursive: true });
+      fs.writeFileSync(credsPath, JSON.stringify(creds));
+      console.log('[PROXY] Extracted credentials from macOS Keychain to ' + credsPath);
     }
   }
 
@@ -164,13 +149,19 @@ function loadConfig() {
 }
 
 // ─── Token Management ───────────────────────────────────────────────────────
-// Read the raw Keychain entry and return the parsed oauth object, or null.
-// Does NOT touch the credentials file — read-only probe.
+const KEYCHAIN_SERVICE_NAMES = ['Claude Code-credentials', 'claude-code', 'claude', 'com.anthropic.claude-code'];
+const TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000;        // refresh when token has < 5 min left
+const PROACTIVE_SYNC_TRIGGER_MS = 30 * 60 * 1000;     // skip Keychain probe if > 30 min remaining
+
+let _cachedKeychainServiceName = null; // remember which service name worked
+
 function readKeychainToken() {
   if (process.platform !== 'darwin') return null;
   const { execSync } = require('child_process');
-  const keychainNames = ['Claude Code-credentials', 'claude-code', 'claude', 'com.anthropic.claude-code'];
-  for (const svc of keychainNames) {
+  const namesToTry = _cachedKeychainServiceName
+    ? [_cachedKeychainServiceName, ...KEYCHAIN_SERVICE_NAMES.filter(n => n !== _cachedKeychainServiceName)]
+    : KEYCHAIN_SERVICE_NAMES;
+  for (const svc of namesToTry) {
     try {
       const token = execSync('security find-generic-password -s "' + svc + '" -w 2>/dev/null', { encoding: 'utf8' }).trim();
       if (!token) continue;
@@ -181,6 +172,7 @@ function readKeychainToken() {
         }
       }
       if (creds && creds.claudeAiOauth && creds.claudeAiOauth.accessToken) {
+        _cachedKeychainServiceName = svc;
         return creds;
       }
     } catch(e) { /* not found or access denied */ }
@@ -188,8 +180,21 @@ function readKeychainToken() {
   return null;
 }
 
-// Lazy refresh: called by getToken when the file token is expired.
-// Writes Keychain token to file if it's valid (future expiry).
+// Mtime-keyed cache of the parsed credentials file. Avoids re-reading and
+// re-parsing JSON on every proxied request. Invalidated automatically when
+// the file changes on disk (refreshFromKeychain writes update mtime).
+let _credsCache = { path: null, mtimeMs: 0, parsed: null };
+
+function readCredsFile(credsPath) {
+  const st = fs.statSync(credsPath);
+  if (_credsCache.path === credsPath && _credsCache.mtimeMs === st.mtimeMs) {
+    return _credsCache.parsed;
+  }
+  const parsed = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+  _credsCache = { path: credsPath, mtimeMs: st.mtimeMs, parsed };
+  return parsed;
+}
+
 function refreshFromKeychain(credsPath) {
   const creds = readKeychainToken();
   if (!creds || creds.claudeAiOauth.expiresAt <= Date.now()) return null;
@@ -197,40 +202,41 @@ function refreshFromKeychain(credsPath) {
   return creds.claudeAiOauth;
 }
 
-// Proactive refresh: compares Keychain against file; if Keychain has a
-// strictly newer token, updates the file. Returns { updated, reason }.
+// Compares Keychain against file; if Keychain has a strictly newer token,
+// updates the file. Returns { updated, newExpiresAt? }.
 function proactiveKeychainSync(credsPath) {
-  const kc = readKeychainToken();
-  if (!kc) return { updated: false, reason: 'keychain_unavailable' };
-  const kcExp = kc.claudeAiOauth.expiresAt || 0;
-  if (kcExp <= Date.now()) return { updated: false, reason: 'keychain_token_expired' };
-
+  // Skip the subprocess when the file token still has plenty of life — the
+  // 5-minute periodic timer would otherwise spawn `security` for nothing.
   let fileExp = 0;
   try {
-    const fileCreds = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+    const fileCreds = readCredsFile(credsPath);
     fileExp = (fileCreds.claudeAiOauth && fileCreds.claudeAiOauth.expiresAt) || 0;
-  } catch(e) { /* file missing or corrupt — treat as stale */ }
+  } catch(e) { /* file missing or corrupt — treat as stale, force probe */ }
 
-  if (kcExp > fileExp) {
-    fs.writeFileSync(credsPath, JSON.stringify(kc));
-    return { updated: true, reason: 'keychain_newer', newExpiresAt: kcExp };
+  if (fileExp > Date.now() + PROACTIVE_SYNC_TRIGGER_MS) {
+    return { updated: false };
   }
-  return { updated: false, reason: 'file_up_to_date' };
+
+  const kc = readKeychainToken();
+  if (!kc) return { updated: false };
+  const kcExp = kc.claudeAiOauth.expiresAt || 0;
+  if (kcExp <= Date.now() || kcExp <= fileExp) return { updated: false };
+
+  fs.writeFileSync(credsPath, JSON.stringify(kc));
+  return { updated: true, newExpiresAt: kcExp };
 }
 
 function getToken(credsPath) {
-  const raw = fs.readFileSync(credsPath, 'utf8');
-  const creds = JSON.parse(raw);
+  const creds = readCredsFile(credsPath);
   const oauth = creds.claudeAiOauth;
   if (!oauth || !oauth.accessToken) {
     throw new Error('No OAuth token in credentials file. Run "claude auth login".');
   }
-  // If token is expired or expiring within 5 minutes, try Keychain refresh (macOS)
-  if (oauth.expiresAt && oauth.expiresAt < Date.now() + 300000) {
+  if (oauth.expiresAt && oauth.expiresAt < Date.now() + TOKEN_REFRESH_BUFFER_MS) {
     const refreshed = refreshFromKeychain(credsPath);
     if (refreshed) return refreshed;
-    // On non-macOS, or if Keychain had no fresh token, warn but return stale token
-    // so the caller gets a clear 401 from the API rather than a cryptic local error
+    // Stale token returned so caller gets a clear 401 from upstream rather
+    // than a cryptic local error.
     const expiredAgo = ((Date.now() - oauth.expiresAt) / 60000).toFixed(0);
     console.error(`[PROXY] Token expired ${expiredAgo}m ago. Run "claude auth login" to refresh.`);
   }
@@ -684,6 +690,8 @@ const dashboard = {
 };
 
 // ─── Server ─────────────────────────────────────────────────────────────────
+let serverRefreshInterval = null;
+
 function startServer(config) {
   let requestCount = 0;
 
@@ -831,10 +839,8 @@ function startServer(config) {
   });
 
   server.listen(config.port, '127.0.0.1', () => {
-    // Startup Keychain health check + initial proactive sync (macOS only)
     if (process.platform === 'darwin') {
-      const kc = readKeychainToken();
-      if (!kc) {
+      if (!readKeychainToken()) {
         console.error('[PROXY] WARNING: macOS Keychain not readable. Automatic token refresh disabled.');
         console.error('[PROXY]   If prompted by macOS, choose "Always Allow" for "security" to access "Claude Code-credentials".');
         console.error('[PROXY]   You can pre-authorize by running: security find-generic-password -s "Claude Code-credentials" -w');
@@ -842,21 +848,23 @@ function startServer(config) {
         const result = proactiveKeychainSync(config.credsPath);
         if (result.updated) {
           const h = ((result.newExpiresAt - Date.now()) / 3600000).toFixed(1);
-          console.error(`[PROXY] Keychain sync: refreshed token from Keychain (${h}h remaining).`);
+          console.log(`[PROXY] Keychain sync: refreshed token from Keychain (${h}h remaining).`);
         }
       }
-      // Periodic proactive refresh every 5 minutes — picks up Claude Code's
-      // background token refreshes before the file token expires.
+      // Periodic proactive refresh — picks up Claude Code's background token
+      // refreshes before the file token expires.
       serverRefreshInterval = setInterval(() => {
         try {
           const r = proactiveKeychainSync(config.credsPath);
-          if (r.updated && dashboard.isTTY === false) {
+          // Only log when stdout isn't owned by the dashboard renderer,
+          // otherwise the line corrupts the in-place TTY output.
+          if (r.updated && !dashboard.isTTY) {
             const h = ((r.newExpiresAt - Date.now()) / 3600000).toFixed(1);
             console.log(`[PROXY] Token auto-refreshed from Keychain (${h}h remaining)`);
           }
         } catch(e) { /* silent */ }
       }, 5 * 60 * 1000);
-      if (serverRefreshInterval.unref) serverRefreshInterval.unref();
+      serverRefreshInterval.unref();
     }
 
     try {
@@ -867,17 +875,14 @@ function startServer(config) {
     }
   });
 
-  process.on('SIGINT', () => {
-    if (serverRefreshInterval) clearInterval(serverRefreshInterval);
-    dashboard.shutdown(); process.exit(0);
-  });
-  process.on('SIGTERM', () => {
-    if (serverRefreshInterval) clearInterval(serverRefreshInterval);
-    dashboard.shutdown(); process.exit(0);
-  });
+  for (const sig of ['SIGINT', 'SIGTERM']) {
+    process.on(sig, () => {
+      if (serverRefreshInterval) clearInterval(serverRefreshInterval);
+      dashboard.shutdown();
+      process.exit(0);
+    });
+  }
 }
-
-let serverRefreshInterval = null;
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 if (require.main === module) {
