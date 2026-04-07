@@ -249,6 +249,41 @@ function reverseMap(text, config) {
   return result;
 }
 
+// Maximum keyword length across all reverse-map patterns.
+// Used to determine how much tail data to hold back between SSE chunks,
+// so that a keyword split across two chunks is still caught.
+function maxPatternLen(config) {
+  let max = 0;
+  for (const [sanitized] of config.reverseMap) {
+    if (sanitized.length > max) max = sanitized.length;
+  }
+  return max;
+}
+
+// Creates a stateful streaming reverse-mapper that buffers potential
+// partial matches at chunk boundaries.
+function createStreamReverser(config) {
+  const holdBack = Math.max(0, maxPatternLen(config) - 1);
+  let pending = '';
+
+  return {
+    // Process an incoming chunk; returns the safe-to-flush portion.
+    write(chunk) {
+      pending += chunk;
+      if (pending.length <= holdBack) return '';
+      const safe = pending.slice(0, pending.length - holdBack);
+      pending = pending.slice(pending.length - holdBack);
+      return reverseMap(safe, config);
+    },
+    // Flush remaining buffer (call on stream end).
+    flush() {
+      const rest = pending;
+      pending = '';
+      return reverseMap(rest, config);
+    }
+  };
+}
+
 // ─── Usage Data Persistence ─────────────────────────────────────────────────
 function loadUsageData() {
   try {
@@ -709,12 +744,16 @@ function startServer(config) {
         if (upRes.headers['content-type'] && upRes.headers['content-type'].includes('text/event-stream')) {
           res.writeHead(upRes.statusCode, upRes.headers);
           const tracker = createSSETokenTracker();
+          const reverser = createStreamReverser(config);
           upRes.on('data', (chunk) => {
             const raw = chunk.toString();
             tracker.push(raw);
-            res.write(reverseMap(raw, config));
+            const out = reverser.write(raw);
+            if (out) res.write(out);
           });
           upRes.on('end', () => {
+            const tail = reverser.flush();
+            if (tail) res.write(tail);
             dashboard.logRequest(reqNum, req.method, req.url, upRes.statusCode, tracker.inputTokens, tracker.outputTokens, modelTag);
             res.end();
           });
@@ -785,6 +824,8 @@ module.exports = {
   extractTokensFromSSE,
   processBody,
   reverseMap,
+  createStreamReverser,
+  maxPatternLen,
   getToken,
   loadUsageData,
   saveUsageData,
