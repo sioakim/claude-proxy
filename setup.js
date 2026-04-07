@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Setup script for OpenClaw Billing Proxy
+ * Setup script for Claude Proxy
  *
  * Auto-detects OpenClaw configuration, scans for sessions_* tools,
  * and generates sanitization + reverse mapping rules.
@@ -14,8 +14,8 @@ const os = require('os');
 
 const homeDir = os.homedir();
 
-console.log('\n  OpenClaw Billing Proxy Setup');
-console.log('  ---------------------------\n');
+console.log('\n  Claude Proxy Setup');
+console.log('  ------------------\n');
 
 // Step 1: Check Claude Code auth
 console.log('1. Checking Claude Code authentication...');
@@ -50,7 +50,7 @@ if (!creds && process.platform === 'darwin') {
   const { execSync } = require('child_process');
 
   // Try common Keychain service names
-  const keychainNames = ['claude-code', 'claude', 'com.anthropic.claude-code'];
+  const keychainNames = ['Claude Code-credentials', 'claude-code', 'claude', 'com.anthropic.claude-code'];
   let keychainToken = null;
 
   for (const svc of keychainNames) {
@@ -138,7 +138,7 @@ if (!creds) {
   console.error('   Searched for credentials at:');
   for (const p of credsPaths) { console.error('     ' + p); }
   if (process.platform === 'darwin') {
-    console.error('     macOS Keychain (claude-code, claude, com.anthropic.claude-code)');
+    console.error('     macOS Keychain (Claude Code-credentials, claude-code, claude, com.anthropic.claude-code)');
   }
   console.error('');
   console.error('   If claude auth status shows you are logged in but no file exists,');

@@ -1,4 +1,6 @@
-# OpenClaw Subscription Billing Proxy
+# Claude Proxy
+
+> A standalone fork of [openclaw-billing-proxy](https://github.com/zacdcook/openclaw-billing-proxy) — original work credited under the MIT License. See [LICENSE](LICENSE).
 
 Route your OpenClaw API requests through your Claude Max/Pro subscription instead of Extra Usage billing.
 
@@ -6,7 +8,7 @@ Route your OpenClaw API requests through your Claude Max/Pro subscription instea
 
 After Anthropic revoked subscription billing for third-party tools (April 4, 2026), OpenClaw requests are billed to Extra Usage. This proxy sits between OpenClaw and the Anthropic API, injecting Claude Code's billing identifier so requests use your existing subscription.
 
-**Zero cost increase. Full OpenClaw functionality. No code changes to OpenClaw.**
+**Zero cost increase. Full OpenClaw functionality. No code changes to OpenClaw. Real-time usage dashboard.**
 
 ## How It Works
 
@@ -54,8 +56,8 @@ claude auth status
 
 ```bash
 # 1. Clone
-git clone https://github.com/zacdcook/openclaw-billing-proxy
-cd openclaw-billing-proxy
+git clone https://github.com/sioakim/claude-proxy
+cd claude-proxy
 
 # 2. Run setup (auto-detects your config)
 node setup.js
@@ -131,9 +133,9 @@ If you have a custom assistant name that Anthropic blocks (test by checking if r
 
 ### Linux (systemd)
 ```bash
-sudo tee /etc/systemd/system/openclaw-proxy.service << EOF
+sudo tee /etc/systemd/system/claude-proxy.service << EOF
 [Unit]
-Description=OpenClaw Billing Proxy
+Description=Claude Proxy
 After=network.target
 
 [Service]
@@ -145,8 +147,8 @@ User=YOUR_USER
 WantedBy=multi-user.target
 EOF
 
-sudo systemctl enable openclaw-proxy
-sudo systemctl start openclaw-proxy
+sudo systemctl enable claude-proxy
+sudo systemctl start claude-proxy
 ```
 
 ### Windows (startup)
@@ -158,8 +160,51 @@ timeout /t 2 /nobreak >nul
 
 ### PM2
 ```bash
-pm2 start proxy.js --name openclaw-proxy
+pm2 start proxy.js --name claude-proxy
 pm2 save
+```
+
+## Dashboard
+
+When running in a terminal, the proxy displays a real-time dashboard:
+
+```
+  Claude Proxy                  Port: 18801   Uptime: 2h 14m
+  Sub: max            Token: 7.7h remaining
+  5h [██████░░░░░░░░░] 40% 1h30m    7d [███░░░░░░░░░░░░] 20% 4d12h
+  ──────────────────────────────────────────────────────────────────
+                                       Input        Output
+  Today (2026-04-07)                     100         8,220   (46)
+  Yesterday                          283,094       211,779   (880)
+  ──────────────────────────────────────────────────────────────────
+  Total (2d)                         283,194       219,999   (926)
+
+  RECENT ACTIVITY
+  S [14:32:07] #37 POST /v1/messages 200   ↑1,204    ↓389
+  O [14:31:55] #36 POST /v1/messages 200     ↑980    ↓201
+
+  [i] info  [q] quit
+```
+
+- **Rate bars** -- 5h and 7d unified rate window utilization from response headers (green <50%, yellow 50–80%, red >80%) with countdown until each window resets
+- **Token table** -- Daily input/output token totals with up to 7 days of history
+- **Recent activity** -- Last 10 requests with model tag (S/H/O = Sonnet/Haiku/Opus), status, and token counts (↑ in, ↓ out)
+
+### Keyboard Shortcuts
+
+| Key | Action |
+|-----|--------|
+| `i` | Toggle info screen (explains every element) |
+| `q` | Quit the proxy |
+
+When stdout is not a TTY (e.g., piped or running as a service), the proxy falls back to plain text logging.
+
+### Usage Data
+
+Token usage is persisted to `./data/usage.json` and survives restarts. The file is updated with a 2-second debounce after each request and flushed on shutdown.
+
+```bash
+cat data/usage.json   # view raw usage data
 ```
 
 ## Token Refresh
