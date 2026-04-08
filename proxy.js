@@ -87,6 +87,7 @@ function loadConfig() {
   const args = process.argv.slice(2);
   let configPath = null;
   let port = DEFAULT_PORT;
+  let cacheEnabled = true;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--port' && args[i + 1]) {
@@ -97,6 +98,7 @@ function loadConfig() {
       }
     }
     if (args[i] === '--config' && args[i + 1]) configPath = args[i + 1];
+    if (args[i] === '--no-cache') cacheEnabled = false;
   }
 
   let config = {};
@@ -149,6 +151,7 @@ function loadConfig() {
   return {
     port: config.port || port,
     credsPath,
+    cacheEnabled,
     replacements: config.replacements || DEFAULT_REPLACEMENTS,
     reverseMap: config.reverseMap || DEFAULT_REVERSE_MAP
   };
@@ -250,37 +253,82 @@ function getToken(credsPath) {
 }
 
 // ─── Request Processing ─────────────────────────────────────────────────────
-function processBody(bodyStr, config) {
-  let modified = bodyStr;
+const BILLING_OBJ = JSON.parse(BILLING_BLOCK);
+const CACHE_1H = { type: 'ephemeral', ttl: '1h' };
 
+function processBody(bodyStr, config) {
   // 1. Apply sanitization -- raw string replacement preserves original JSON formatting
+  let modified = bodyStr;
   for (const [find, replace] of config.replacements) {
     modified = modified.split(find).join(replace);
   }
 
-  // 2. Inject billing block into system prompt
-  const sysArrayIdx = modified.indexOf('"system":[');
-  if (sysArrayIdx !== -1) {
-    const insertAt = sysArrayIdx + '"system":['.length;
-    modified = modified.slice(0, insertAt) + BILLING_BLOCK + ',' + modified.slice(insertAt);
-  } else if (modified.includes('"system":"')) {
-    const sysStart = modified.indexOf('"system":"');
-    let i = sysStart + '"system":"'.length;
-    while (i < modified.length) {
-      if (modified[i] === '\\') { i += 2; continue; }
-      if (modified[i] === '"') break;
-      i++;
-    }
-    const sysEnd = i + 1;
-    const originalSysStr = modified.slice(sysStart + '"system":'.length, sysEnd);
-    modified = modified.slice(0, sysStart)
-      + '"system":[' + BILLING_BLOCK + ',{"type":"text","text":' + originalSysStr + '}]'
-      + modified.slice(sysEnd);
-  } else {
-    modified = '{"system":[' + BILLING_BLOCK + '],' + modified.slice(1);
-  }
+  // 2. Parse JSON for structured modifications (billing + cache_control)
+  try {
+    const parsed = JSON.parse(modified);
 
-  return modified;
+    // Inject billing block into system prompt
+    if (Array.isArray(parsed.system)) {
+      parsed.system.unshift(BILLING_OBJ);
+    } else if (typeof parsed.system === 'string') {
+      parsed.system = [BILLING_OBJ, { type: 'text', text: parsed.system }];
+    } else {
+      parsed.system = [BILLING_OBJ];
+    }
+
+    // Add cache_control breakpoints (1h TTL) for prompt caching
+    if (config.cacheEnabled) {
+      // Last system block
+      if (Array.isArray(parsed.system) && parsed.system.length > 0) {
+        parsed.system[parsed.system.length - 1].cache_control = CACHE_1H;
+      }
+
+      // Last tool
+      if (Array.isArray(parsed.tools) && parsed.tools.length > 0) {
+        parsed.tools[parsed.tools.length - 1].cache_control = CACHE_1H;
+      }
+
+      // Last user message (caches entire conversation history)
+      if (Array.isArray(parsed.messages)) {
+        for (let i = parsed.messages.length - 1; i >= 0; i--) {
+          if (parsed.messages[i].role === 'user') {
+            const msg = parsed.messages[i];
+            if (Array.isArray(msg.content) && msg.content.length > 0) {
+              msg.content[msg.content.length - 1].cache_control = CACHE_1H;
+            } else if (typeof msg.content === 'string') {
+              msg.content = [{ type: 'text', text: msg.content, cache_control: CACHE_1H }];
+            }
+            break;
+          }
+        }
+      }
+    }
+
+    return JSON.stringify(parsed);
+  } catch (e) {
+    // Fallback: string-based injection if JSON parse fails
+    const sysArrayIdx = modified.indexOf('"system":[');
+    if (sysArrayIdx !== -1) {
+      const insertAt = sysArrayIdx + '"system":['.length;
+      modified = modified.slice(0, insertAt) + BILLING_BLOCK + ',' + modified.slice(insertAt);
+    } else if (modified.includes('"system":"')) {
+      const sysStart = modified.indexOf('"system":"');
+      let i = sysStart + '"system":"'.length;
+      while (i < modified.length) {
+        if (modified[i] === '\\') { i += 2; continue; }
+        if (modified[i] === '"') break;
+        i++;
+      }
+      const sysEnd = i + 1;
+      const originalSysStr = modified.slice(sysStart + '"system":'.length, sysEnd);
+      modified = modified.slice(0, sysStart)
+        + '"system":[' + BILLING_BLOCK + ',{"type":"text","text":' + originalSysStr + '}]'
+        + modified.slice(sysEnd);
+    } else {
+      modified = '{"system":[' + BILLING_BLOCK + '],' + modified.slice(1);
+    }
+    return modified;
+  }
 }
 
 // ─── Response Processing ────────────────────────────────────────────────────
@@ -432,7 +480,7 @@ const dashboard = {
       // Non-TTY fallback: plain text banner
       const h = ((oauth.expiresAt - Date.now()) / 3600000).toFixed(1);
       console.log(`\n  Claude Proxy`);
-      console.log(`  Port: ${config.port}  Sub: ${oauth.subscriptionType}  Token: ${h}h`);
+      console.log(`  Port: ${config.port}  Sub: ${oauth.subscriptionType}  Token: ${h}h  Cache: ${config.cacheEnabled ? '1h TTL' : 'off'}`);
       console.log(`  Ready. Set openclaw.json baseUrl to http://127.0.0.1:${config.port}\n`);
       return;
     }
