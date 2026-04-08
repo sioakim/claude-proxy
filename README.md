@@ -131,6 +131,43 @@ If you have a custom assistant name that Anthropic blocks (test by checking if r
 
 ## Running as a Service
 
+### macOS (launchd) — Recommended
+
+```bash
+cat > ~/Library/LaunchAgents/com.openclaw.billing-proxy.plist << 'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.openclaw.billing-proxy</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/node</string>
+        <string>/path/to/proxy.js</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/path/to/claude-proxy</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/openclaw-billing-proxy.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/openclaw-billing-proxy.log</string>
+</dict>
+</plist>
+EOF
+
+launchctl load ~/Library/LaunchAgents/com.openclaw.billing-proxy.plist
+```
+
+To restart:
+```bash
+launchctl kickstart -k gui/$(id -u)/com.openclaw.billing-proxy
+```
+
 ### Linux (systemd)
 ```bash
 sudo tee /etc/systemd/system/claude-proxy.service << EOF
@@ -209,10 +246,48 @@ cat data/usage.json   # view raw usage data
 
 ## Token Refresh
 
-Claude Code's OAuth token expires every ~24 hours. The proxy reads the token fresh from disk on each request. To refresh:
+Claude Code's OAuth token expires roughly every 8–24 hours. The proxy reads the token from `~/.claude/.credentials.json` on each request. If the token expires, all requests will 401.
 
-- **Easiest**: Open Claude Code CLI briefly -- it auto-refreshes on startup
-- **Automated**: Set up a cron that runs `claude -p "ping" --max-turns 1 --no-session-persistence` daily (triggers auth refresh)
+### The Problem (macOS)
+
+On macOS, Claude Code stores refreshed tokens in the **macOS Keychain** (`Claude Code-credentials`), but does not always write the updated token back to the credentials JSON file. This means the file goes stale while the Keychain has a valid token — and the proxy only reads the file.
+
+### Manual Refresh
+
+- Open Claude Code CLI briefly — it auto-refreshes on startup:
+  ```bash
+  claude --print "."
+  ```
+- Then sync the token from Keychain to the file (macOS only):
+  ```bash
+  security find-generic-password -s "Claude Code-credentials" -w > ~/.claude/.credentials.json
+  ```
+
+### Automated Refresh (Recommended)
+
+The included `refresh-token.sh` script handles the full refresh cycle:
+
+1. Runs `claude --print "."` to trigger Claude Code's internal OAuth refresh
+2. Reads the fresh token from macOS Keychain
+3. Writes it to `~/.claude/.credentials.json`
+4. Restarts the proxy via launchctl
+
+```bash
+# Run manually
+./refresh-token.sh
+
+# Or schedule with cron (every 6 hours)
+crontab -e
+0 */6 * * * /path/to/claude-proxy/refresh-token.sh >> /tmp/refresh-token.log 2>&1
+```
+
+**Environment variables:**
+- `CLAUDE_CREDENTIALS_PATH` — override credentials file path (default: `~/.claude/.credentials.json`)
+- `PROXY_PORT` — override proxy port for health check (default: `18801`)
+
+### Non-macOS Systems
+
+On Linux/Windows, Claude Code writes tokens directly to the credentials file, so the Keychain sync issue doesn't apply. A simple cron running `claude -p "ping" --max-turns 1 --no-session-persistence` is sufficient to keep the token fresh.
 
 ## Health Check
 
@@ -289,10 +364,11 @@ This tests 8 layers independently (credentials, token, API, billing header, trig
 - Ensure every `replacements` entry has a matching `reverseMap` entry
 - Use space-free replacements (e.g., `ocplatform`, NOT `assistant platform`) to avoid breaking filesystem paths
 
-**Empty credentials file on Mac**
-- Some Claude Code versions store tokens in macOS Keychain instead of a file
-- Run `claude -p "test" --max-turns 1` to force credential write
-- Check Keychain: `security find-generic-password -s "claude" -w 2>/dev/null`
+**Empty credentials file on Mac / Token keeps expiring**
+- Claude Code stores refreshed tokens in macOS Keychain (`Claude Code-credentials`) but doesn't always update the JSON file
+- Run `./refresh-token.sh` to sync Keychain → file and restart the proxy
+- Or manually: `security find-generic-password -s "Claude Code-credentials" -w > ~/.claude/.credentials.json`
+- Set up the cron (see [Token Refresh](#token-refresh)) to prevent recurring expiry
 
 ## Rollback
 
