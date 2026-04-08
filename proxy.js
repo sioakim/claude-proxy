@@ -89,7 +89,13 @@ function loadConfig() {
   let port = DEFAULT_PORT;
 
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--port' && args[i + 1]) port = parseInt(args[i + 1]);
+    if (args[i] === '--port' && args[i + 1]) {
+      port = parseInt(args[i + 1], 10);
+      if (isNaN(port) || port < 1 || port > 65535) {
+        console.error('[ERROR] Invalid port: ' + args[i + 1] + '. Must be 1-65535.');
+        process.exit(1);
+      }
+    }
     if (args[i] === '--config' && args[i + 1]) configPath = args[i + 1];
   }
 
@@ -122,8 +128,8 @@ function loadConfig() {
     const creds = readKeychainToken();
     if (creds) {
       credsPath = path.join(homeDir, '.claude', '.credentials.json');
-      fs.mkdirSync(path.join(homeDir, '.claude'), { recursive: true });
-      fs.writeFileSync(credsPath, JSON.stringify(creds));
+      fs.mkdirSync(path.join(homeDir, '.claude'), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(credsPath, JSON.stringify(creds), { mode: 0o600 });
       console.log('[PROXY] Extracted credentials from macOS Keychain to ' + credsPath);
     }
   }
@@ -157,13 +163,13 @@ let _cachedKeychainServiceName = null; // remember which service name worked
 
 function readKeychainToken() {
   if (process.platform !== 'darwin') return null;
-  const { execSync } = require('child_process');
+  const { execFileSync } = require('child_process');
   const namesToTry = _cachedKeychainServiceName
     ? [_cachedKeychainServiceName, ...KEYCHAIN_SERVICE_NAMES.filter(n => n !== _cachedKeychainServiceName)]
     : KEYCHAIN_SERVICE_NAMES;
   for (const svc of namesToTry) {
     try {
-      const token = execSync('security find-generic-password -s "' + svc + '" -w 2>/dev/null', { encoding: 'utf8' }).trim();
+      const token = execFileSync('security', ['find-generic-password', '-s', svc, '-w'], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).trim();
       if (!token) continue;
       let creds;
       try { creds = JSON.parse(token); } catch(e) {
@@ -198,7 +204,7 @@ function readCredsFile(credsPath) {
 function refreshFromKeychain(credsPath) {
   const creds = readKeychainToken();
   if (!creds || creds.claudeAiOauth.expiresAt <= Date.now()) return null;
-  fs.writeFileSync(credsPath, JSON.stringify(creds));
+  fs.writeFileSync(credsPath, JSON.stringify(creds), { mode: 0o600 });
   return creds.claudeAiOauth;
 }
 
@@ -222,7 +228,7 @@ function proactiveKeychainSync(credsPath) {
   const kcExp = kc.claudeAiOauth.expiresAt || 0;
   if (kcExp <= Date.now() || kcExp <= fileExp) return { updated: false };
 
-  fs.writeFileSync(credsPath, JSON.stringify(kc));
+  fs.writeFileSync(credsPath, JSON.stringify(kc), { mode: 0o600 });
   return { updated: true, newExpiresAt: kcExp };
 }
 
@@ -690,6 +696,7 @@ const dashboard = {
 };
 
 // ─── Server ─────────────────────────────────────────────────────────────────
+const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10 MB
 let serverRefreshInterval = null;
 
 function startServer(config) {
@@ -712,8 +719,9 @@ function startServer(config) {
           reverseMapPatterns: config.reverseMap.length
         }));
       } catch (e) {
+        console.error('[PROXY] Health check error:', e.message);
         res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'error', message: e.message }));
+        res.end(JSON.stringify({ status: 'error', message: 'Internal server error' }));
       }
       return;
     }
@@ -721,8 +729,18 @@ function startServer(config) {
     requestCount++;
     const reqNum = requestCount;
     const chunks = [];
+    let bodySize = 0;
 
-    req.on('data', c => chunks.push(c));
+    req.on('data', c => {
+      bodySize += c.length;
+      if (bodySize > MAX_BODY_SIZE) {
+        req.destroy();
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: { message: 'Request body too large (max 10MB)' } }));
+        return;
+      }
+      chunks.push(c);
+    });
     req.on('end', () => {
       let body = Buffer.concat(chunks);
 
@@ -730,8 +748,9 @@ function startServer(config) {
       try {
         oauth = getToken(config.credsPath);
       } catch (e) {
+        console.error('[PROXY] Token error:', e.message);
         res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ type: 'error', error: { message: e.message } }));
+        res.end(JSON.stringify({ type: 'error', error: { message: 'Failed to load credentials' } }));
         return;
       }
 
@@ -829,7 +848,7 @@ function startServer(config) {
         dashboard.logError(reqNum, req.method, req.url, e.message);
         if (!res.headersSent) {
           res.writeHead(502, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ type: 'error', error: { message: e.message } }));
+          res.end(JSON.stringify({ type: 'error', error: { message: 'Upstream connection failed' } }));
         }
       });
 
