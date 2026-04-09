@@ -37,14 +37,80 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
 
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.0.0';
+const VERSION = '2.1.0';
 const USAGE_FILE = path.join(__dirname, 'data', 'usage.json');
 
-// Claude Code billing identifier -- injected into the system prompt
+// ─── Layer 8: Claude Code Identity & Billing ───────────────────────
+const CC_VERSION = '2.1.97';
+const BILLING_HASH_SALT = '59cf53e54c78';
+const BILLING_HASH_INDICES = [4, 7, 20];
+const DEVICE_ID = crypto.randomBytes(32).toString('hex');
+const SESSION_ID = crypto.randomUUID();
+
+// Claude Code identity string — injected as system prompt block
+const CLAUDE_CODE_IDENTITY_STRING = 'You are Claude Code, Anthropic\'s official CLI for Claude.';
+
+// Dynamic billing fingerprint — replaces static BILLING_BLOCK
+function computeBillingFingerprint(firstUserMessage, version) {
+  const input = (firstUserMessage || '').slice(0, 8) + BILLING_HASH_SALT + version;
+  const hash = crypto.createHash('sha256').update(input).digest('hex');
+  return BILLING_HASH_INDICES.map(i => hash[i]).join('');
+}
+
+function extractFirstUserMessageText(bodyStr) {
+  try {
+    const parsed = JSON.parse(bodyStr);
+    if (Array.isArray(parsed.messages)) {
+      for (const msg of parsed.messages) {
+        if (msg.role === 'user') {
+          if (typeof msg.content === 'string') return msg.content;
+          if (Array.isArray(msg.content)) {
+            for (const block of msg.content) {
+              if (block.type === 'text' && block.text) return block.text;
+            }
+          }
+          return '';
+        }
+      }
+    }
+  } catch (e) { /* ignore */ }
+  return '';
+}
+
+function buildBillingBlock(firstUserMessage) {
+  const fp = computeBillingFingerprint(firstUserMessage, CC_VERSION);
+  return {
+    type: 'text',
+    text: `x-anthropic-billing-header: cc_version=${CC_VERSION}.${fp}; cc_entrypoint=sdk-cli; cch=00000;`
+  };
+}
+
+// Stainless SDK helpers
+function getStainlessOs() {
+  const p = process.platform;
+  if (p === 'darwin') return 'Mac OS X';
+  if (p === 'win32') return 'Windows';
+  if (p === 'linux') return 'Linux';
+  return 'Other:' + p;
+}
+
+function getStainlessArch() {
+  const a = process.arch;
+  if (a === 'arm64') return 'arm64';
+  if (a === 'x64') return 'x64';
+  return a;
+}
+
+function buildUserAgent() {
+  return `claude-cli/${CC_VERSION} (third-party, cli)`;
+}
+
+// Legacy static block kept for test.js exports compatibility
 const BILLING_BLOCK = '{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.80.a46; cc_entrypoint=sdk-cli; cch=00000;"}';
 
 // Beta flags required for OAuth + Claude Code features
@@ -54,7 +120,9 @@ const REQUIRED_BETAS = [
   'interleaved-thinking-2025-05-14',
   'context-management-2025-06-27',
   'prompt-caching-scope-2026-01-05',
-  'effort-2025-11-24'
+  'effort-2025-11-24',
+  'advanced-tool-use-2025-11-20',
+  'fast-mode-2026-02-01'
 ];
 
 // ─── CC Tool Stubs ──────────────────────────────────────────────────────────
@@ -338,7 +406,7 @@ function findMatchingBracket(str, start) {
 }
 
 // ─── Request Processing ─────────────────────────────────────────────────────
-const BILLING_OBJ = JSON.parse(BILLING_BLOCK);
+// BILLING_OBJ removed — now uses dynamic buildBillingBlock()
 const CACHE_1H = { type: 'ephemeral', ttl: '1h' };
 
 function processBody(bodyStr, config) {
@@ -434,14 +502,43 @@ function processBody(bodyStr, config) {
   try {
     const parsed = JSON.parse(modified);
 
-    // Inject billing block into system prompt
+    // Layer 8: Dynamic billing block + Claude Code identity
+    const firstUserMsg = extractFirstUserMessageText(modified);
+    const billingObj = buildBillingBlock(firstUserMsg);
+    const identityObj = { type: 'text', text: CLAUDE_CODE_IDENTITY_STRING };
+
+    // Inject billing + identity into system prompt
     if (Array.isArray(parsed.system)) {
-      parsed.system.unshift(BILLING_OBJ);
+      parsed.system.unshift(identityObj);
+      parsed.system.unshift(billingObj);
     } else if (typeof parsed.system === 'string') {
-      parsed.system = [BILLING_OBJ, { type: 'text', text: parsed.system }];
+      parsed.system = [billingObj, identityObj, { type: 'text', text: parsed.system }];
     } else {
-      parsed.system = [BILLING_OBJ];
+      parsed.system = [billingObj, identityObj];
     }
+
+    // Layer 8: Request metadata injection
+    if (!parsed.metadata) parsed.metadata = {};
+    parsed.metadata.user_id = DEVICE_ID;
+    if (!parsed.metadata.device_id) parsed.metadata.device_id = DEVICE_ID;
+    if (!parsed.metadata.account_uuid) parsed.metadata.account_uuid = DEVICE_ID;
+    if (!parsed.metadata.session_id) parsed.metadata.session_id = SESSION_ID;
+
+    // Layer 8: Temperature normalization
+    const hasThinking = parsed.thinking && parsed.thinking.type === 'enabled';
+    if (hasThinking) {
+      delete parsed.temperature;
+    } else if (parsed.temperature === undefined || parsed.temperature === null) {
+      parsed.temperature = 1;
+    }
+
+    // Layer 8: Context management injection for thinking requests
+    if (hasThinking && !parsed.context_management) {
+      parsed.context_management = { edits: [] };
+    }
+
+    // Layer 8: Strip stale betas body field (API rejects it; betas are header-only)
+    delete parsed.betas;
 
     // Add cache_control breakpoints (1h TTL) for prompt caching
     if (config.cacheEnabled) {
@@ -477,7 +574,7 @@ function processBody(bodyStr, config) {
     const sysArrayIdx = modified.indexOf('"system":[');
     if (sysArrayIdx !== -1) {
       const insertAt = sysArrayIdx + '"system":['.length;
-      modified = modified.slice(0, insertAt) + BILLING_BLOCK + ',' + modified.slice(insertAt);
+      modified = modified.slice(0, insertAt) + JSON.stringify(buildBillingBlock('')) + ',' + modified.slice(insertAt);
     } else if (modified.includes('"system":"')) {
       const sysStart = modified.indexOf('"system":"');
       let i = sysStart + '"system":"'.length;
@@ -489,10 +586,10 @@ function processBody(bodyStr, config) {
       const sysEnd = i + 1;
       const originalSysStr = modified.slice(sysStart + '"system":'.length, sysEnd);
       modified = modified.slice(0, sysStart)
-        + '"system":[' + BILLING_BLOCK + ',{"type":"text","text":' + originalSysStr + '}]'
+        + '"system":[' + JSON.stringify(buildBillingBlock('')) + ',{"type":"text","text":' + originalSysStr + '}]'
         + modified.slice(sysEnd);
     } else {
-      modified = '{"system":[' + BILLING_BLOCK + '],' + modified.slice(1);
+      modified = '{"system":[' + JSON.stringify(buildBillingBlock('')) + '],' + modified.slice(1);
     }
     return modified;
   }
@@ -674,6 +771,7 @@ const dashboard = {
       const h = ((oauth.expiresAt - Date.now()) / 3600000).toFixed(1);
       console.log(`\n  Claude Proxy v${VERSION}`);
       console.log(`  Port: ${config.port}  Sub: ${oauth.subscriptionType}  Token: ${h}h  Cache: ${config.cacheEnabled ? '1h TTL' : 'off'}`);
+      console.log(`  CC Emulation: v${CC_VERSION}  Device: ${DEVICE_ID.slice(0, 8)}...  Session: ${SESSION_ID.slice(0, 8)}...`);
       console.log(`  Ready. Set openclaw.json baseUrl to http://127.0.0.1:${config.port}\n`);
       return;
     }
@@ -959,6 +1057,11 @@ function startServer(config) {
           subscriptionType: oauth.subscriptionType,
           replacementPatterns: config.replacements.length,
           reverseMapPatterns: config.reverseMap.length,
+          ccEmulation: {
+            ccVersion: CC_VERSION,
+            deviceId: DEVICE_ID.slice(0, 8) + '...',
+            sessionId: SESSION_ID.slice(0, 8) + '...'
+          },
           layers: {
             stringReplacements: config.replacements.length,
             toolNameRenames: config.toolRenames.length,
@@ -1031,6 +1134,23 @@ function startServer(config) {
       }
       headers['anthropic-beta'] = betas.join(',');
 
+      // Layer 8: Stainless SDK headers (Claude Code request signature)
+      headers['user-agent'] = buildUserAgent();
+      headers['x-app'] = 'cli';
+      headers['x-claude-code-session-id'] = SESSION_ID;
+      headers['x-stainless-arch'] = getStainlessArch();
+      headers['x-stainless-lang'] = 'js';
+      headers['x-stainless-os'] = getStainlessOs();
+      headers['x-stainless-package-version'] = CC_VERSION;
+      headers['x-stainless-runtime'] = 'node';
+      headers['x-stainless-runtime-version'] = process.versions.node;
+      headers['x-stainless-retry-count'] = '0';
+      headers['x-stainless-timeout'] = '600000';
+      headers['anthropic-dangerous-direct-browser-access'] = 'true';
+
+      // Strip headers not sent by real Claude Code
+      delete headers['x-session-affinity'];
+
       // Extract model shortcode from request body
       let modelTag = '?';
       const modelMatch = bodyStr.match(/"model"\s*:\s*"([^"]+)"/);
@@ -1041,9 +1161,15 @@ function startServer(config) {
         else if (m.includes('haiku')) modelTag = 'H';
       }
 
+      // Layer 8: URL transform — append ?beta=true to /v1/messages
+      let upstreamPath = req.url;
+      if (upstreamPath.startsWith('/v1/messages') && !upstreamPath.includes('beta=true')) {
+        upstreamPath += upstreamPath.includes('?') ? '&beta=true' : '?beta=true';
+      }
+
       const upstream = https.request({
         hostname: UPSTREAM_HOST, port: 443,
-        path: req.url, method: req.method, headers
+        path: upstreamPath, method: req.method, headers
       }, (upRes) => {
         // Capture rate-limit headers from every response
         dashboard.updateRateLimit(upRes);
@@ -1080,6 +1206,9 @@ function startServer(config) {
               if (parsed.usage) {
                 inputTokens = parsed.usage.input_tokens || 0;
                 outputTokens = parsed.usage.output_tokens || 0;
+              }
+              if (parsed.error) {
+                console.error(`[DEBUG] #${reqNum} Error: ${parsed.error.type}: ${parsed.error.message}`);
               }
             } catch (e) { /* non-JSON or error response */ }
 
@@ -1178,6 +1307,16 @@ module.exports = {
   fmt,
   USAGE_FILE,
   BILLING_BLOCK,
+  CC_VERSION,
+  BILLING_HASH_SALT,
+  BILLING_HASH_INDICES,
+  DEVICE_ID,
+  SESSION_ID,
+  CLAUDE_CODE_IDENTITY_STRING,
+  computeBillingFingerprint,
+  buildBillingBlock,
+  extractFirstUserMessageText,
+  buildUserAgent,
   REQUIRED_BETAS,
   DEFAULT_REPLACEMENTS,
   DEFAULT_REVERSE_MAP,
