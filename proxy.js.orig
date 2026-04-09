@@ -57,31 +57,46 @@ const CLAUDE_CODE_IDENTITY_STRING = 'You are Claude Code, Anthropic\'s official 
 
 // Dynamic billing fingerprint — replaces static BILLING_BLOCK
 function computeBillingFingerprint(firstUserMessage, version) {
-  const chars = BILLING_HASH_INDICES.map(i => (firstUserMessage || '')[i] || '0').join('');
-  const input = `${BILLING_HASH_SALT}${chars}${version}`;
-  return crypto.createHash('sha256').update(input).digest('hex').slice(0, 3);
+  const input = (firstUserMessage || '').slice(0, 8) + BILLING_HASH_SALT + version;
+  const hash = crypto.createHash('sha256').update(input).digest('hex');
+  return BILLING_HASH_INDICES.map(i => hash[i]).join('');
 }
 
 function extractFirstUserMessageText(bodyStr) {
-  const msgMatch = bodyStr.match(/"role"\s*:\s*"user"[\s\S]*?"text"\s*:\s*"([^"]*?)"/);;
-  return msgMatch ? msgMatch[1] : '';
+  try {
+    const parsed = JSON.parse(bodyStr);
+    if (Array.isArray(parsed.messages)) {
+      for (const msg of parsed.messages) {
+        if (msg.role === 'user') {
+          if (typeof msg.content === 'string') return msg.content;
+          if (Array.isArray(msg.content)) {
+            for (const block of msg.content) {
+              if (block.type === 'text' && block.text) return block.text;
+            }
+          }
+          return '';
+        }
+      }
+    }
+  } catch (e) { /* ignore */ }
+  return '';
 }
 
 function buildBillingBlock(firstUserMessage) {
   const fp = computeBillingFingerprint(firstUserMessage, CC_VERSION);
   return {
     type: 'text',
-    text: `x-anthropic-billing-header: cc_version=${CC_VERSION}.${fp}; cc_entrypoint=cli; cch=00000;`
+    text: `x-anthropic-billing-header: cc_version=${CC_VERSION}.${fp}; cc_entrypoint=sdk-cli; cch=00000;`
   };
 }
 
 // Stainless SDK helpers
 function getStainlessOs() {
   const p = process.platform;
-  if (p === 'darwin') return 'macOS';
+  if (p === 'darwin') return 'Mac OS X';
   if (p === 'win32') return 'Windows';
   if (p === 'linux') return 'Linux';
-  return p;
+  return 'Other:' + p;
 }
 
 function getStainlessArch() {
@@ -92,10 +107,11 @@ function getStainlessArch() {
 }
 
 function buildUserAgent() {
-  return `claude-cli/${CC_VERSION} (external, cli)`;
+  return `claude-cli/${CC_VERSION} (third-party, cli)`;
 }
 
-
+// Legacy static block kept for test.js exports compatibility
+const BILLING_BLOCK = '{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.80.a46; cc_entrypoint=sdk-cli; cch=00000;"}';
 
 // Beta flags required for OAuth + Claude Code features
 const REQUIRED_BETAS = [
@@ -489,7 +505,7 @@ function processBody(bodyStr, config) {
     // Layer 8: Dynamic billing block + Claude Code identity
     const firstUserMsg = extractFirstUserMessageText(modified);
     const billingObj = buildBillingBlock(firstUserMsg);
-    const identityObj = { type: 'text', text: CLAUDE_CODE_IDENTITY_STRING, cache_control: CACHE_1H };
+    const identityObj = { type: 'text', text: CLAUDE_CODE_IDENTITY_STRING };
 
     // Inject billing + identity into system prompt
     if (Array.isArray(parsed.system)) {
@@ -502,27 +518,20 @@ function processBody(bodyStr, config) {
     }
 
     // Layer 8: Request metadata injection (only user_id is allowed by the API)
-    const accountUuid = process.env.CLAUDE_CODE_ACCOUNT_UUID || '';
-    parsed.metadata = {
-      ...(parsed.metadata || {}),
-      user_id: JSON.stringify({
-        device_id: DEVICE_ID,
-        account_uuid: accountUuid,
-        session_id: SESSION_ID
-      })
-    };
+    if (!parsed.metadata) parsed.metadata = {};
+    parsed.metadata.user_id = DEVICE_ID;
 
     // Layer 8: Temperature normalization
-    const hasThinking = parsed.thinking && typeof parsed.thinking === 'object' && (parsed.thinking.type === 'adaptive' || parsed.thinking.type === 'enabled');
+    const hasThinking = parsed.thinking && parsed.thinking.type === 'enabled';
     if (hasThinking) {
       delete parsed.temperature;
-    } else {
+    } else if (parsed.temperature === undefined || parsed.temperature === null) {
       parsed.temperature = 1;
     }
 
     // Layer 8: Context management injection for thinking requests
     if (hasThinking && !parsed.context_management) {
-      parsed.context_management = { edits: [{ type: 'clear_thinking_20251015', keep: 'all' }] };
+      parsed.context_management = { edits: [] };
     }
 
     // Layer 8: Strip stale betas body field (API rejects it; betas are header-only)
@@ -1114,9 +1123,6 @@ function startServer(config) {
       headers['content-length'] = body.length;
       headers['accept-encoding'] = 'identity';
 
-      // Anthropic API version (required, matches real CC)
-      headers['anthropic-version'] = '2023-06-01';
-
       // Merge required betas
       const existingBeta = headers['anthropic-beta'] || '';
       const betas = existingBeta ? existingBeta.split(',').map(b => b.trim()) : [];
@@ -1132,11 +1138,11 @@ function startServer(config) {
       headers['x-stainless-arch'] = getStainlessArch();
       headers['x-stainless-lang'] = 'js';
       headers['x-stainless-os'] = getStainlessOs();
-      headers['x-stainless-package-version'] = '0.81.0';
+      headers['x-stainless-package-version'] = CC_VERSION;
       headers['x-stainless-runtime'] = 'node';
-      headers['x-stainless-runtime-version'] = process.version;
+      headers['x-stainless-runtime-version'] = process.versions.node;
       headers['x-stainless-retry-count'] = '0';
-      headers['x-stainless-timeout'] = '600';
+      headers['x-stainless-timeout'] = '600000';
       headers['anthropic-dangerous-direct-browser-access'] = 'true';
 
       // Strip headers not sent by real Claude Code
@@ -1152,21 +1158,10 @@ function startServer(config) {
         else if (m.includes('haiku')) modelTag = 'H';
       }
 
-      // Layer 8: URL transform — normalize path and append ?beta=true
+      // Layer 8: URL transform — append ?beta=true to /v1/messages
       let upstreamPath = req.url;
-      try {
-        const url = new URL(req.url, `https://${UPSTREAM_HOST}`);
-        const p = url.pathname;
-        const isMessages = p === '/v1/messages' || p === '/messages' || p === '/v1/messages/count_tokens' || p === '/messages/count_tokens';
-        if (isMessages && !url.searchParams.has('beta')) {
-          if (!p.startsWith('/v1/')) {
-            url.pathname = '/v1' + p;
-          }
-          url.searchParams.set('beta', 'true');
-          upstreamPath = url.pathname + url.search;
-        }
-      } catch (e) {
-        // Keep original path on parse error
+      if (upstreamPath.startsWith('/v1/messages') && !upstreamPath.includes('beta=true')) {
+        upstreamPath += upstreamPath.includes('?') ? '&beta=true' : '?beta=true';
       }
 
       const upstream = https.request({
@@ -1308,6 +1303,7 @@ module.exports = {
   dashboard,
   fmt,
   USAGE_FILE,
+  BILLING_BLOCK,
   CC_VERSION,
   BILLING_HASH_SALT,
   BILLING_HASH_INDICES,
