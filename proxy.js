@@ -524,14 +524,9 @@ function processBody(bodyStr, config) {
     }
 
     // Layer 8: Request metadata injection (only user_id is allowed by the API)
-    const accountUuid = process.env.CLAUDE_CODE_ACCOUNT_UUID || '';
     parsed.metadata = {
       ...(parsed.metadata || {}),
-      user_id: JSON.stringify({
-        device_id: DEVICE_ID,
-        account_uuid: accountUuid,
-        session_id: SESSION_ID
-      })
+      user_id: JSON.stringify({ device_id: DEVICE_ID, session_id: SESSION_ID })
     };
 
     // Layer 8: Temperature normalization
