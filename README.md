@@ -6,288 +6,217 @@ Route your OpenClaw API requests through your Claude Max/Pro subscription instea
 
 ## What This Does
 
-After Anthropic revoked subscription billing for third-party tools (April 4, 2026), OpenClaw requests are billed to Extra Usage. This proxy sits between OpenClaw and the Anthropic API, injecting Claude Code's billing identifier so requests use your existing subscription.
+After Anthropic revoked subscription billing for third-party tools (April 4, 2026), OpenClaw requests are billed to Extra Usage. This proxy sits between OpenClaw and the Anthropic API, transforming requests to be indistinguishable from real Claude Code at every level — billing, headers, body structure, and tool signatures.
 
-**Zero cost increase. Full OpenClaw functionality. No code changes to OpenClaw. Real-time usage dashboard.**
+**Zero cost increase. Full OpenClaw functionality. No code changes to OpenClaw.**
 
-## How It Works
+## Detection Bypass Layers
 
-The proxy performs bidirectional request/response processing:
+The proxy applies 8 layers of transformation plus additional hardening:
 
-**Outbound (request to API):**
-1. **Billing Header** -- Injects an 84-character Claude Code billing identifier into the system prompt
-2. **Token Swap** -- Replaces OpenClaw's auth token with your Claude Code OAuth token
-3. **Sanitization** -- Replaces trigger phrases that Anthropic's streaming classifier detects (8 default patterns)
+| Layer | Name | What It Does |
+|-------|------|-------------|
+| 1 | **Billing Fingerprint** | Dynamic SHA256-based 3-char hash from message content + salt + CC version. Injected as system prompt block. |
+| 2 | **String Sanitization** | 30 pattern replacements: `OpenClaw` → `OCPlatform`, `sessions_spawn` → `create_task`, `HEARTBEAT` → `HB_SIGNAL`, etc. |
+| 3 | **Tool Name Bypass** | 29 tool renames using `"name":"X"` prefix to avoid content type collision (e.g., `exec` → `Bash`, `message` → `SendMessage`). |
+| 4 | **System Prompt Strip** | Removes ~35K chars of OpenClaw config template, replaces with brief paraphrase. |
+| 5 | **Description Strip** | Empties verbose tool descriptions that fingerprint OpenClaw. |
+| 6 | **Property Renames** | 8 OC-specific schema properties renamed (`session_id` → `thread_id`, etc.). |
+| 7 | **Reverse Mapping** | Bidirectional SSE + JSON response processing with chunk-boundary-safe streaming. |
+| 8 | **CC Signature Emulation** | Full Claude Code HTTP signature: Stainless SDK headers, user-agent, metadata, temperature normalization, context management, `?beta=true` URL transform. |
 
-**Inbound (response to OpenClaw):**
-4. **Reverse Mapping** -- Restores original tool names, file paths, and identifiers so OpenClaw sees its real terms
-
-This ensures Anthropic sees a "Claude Code" request while OpenClaw sees its original tool names and paths.
+**Additional hardening:**
+- **Prompt caching** — 1h ephemeral TTL on identity block
+- **Assistant prefill stripping** — Removes trailing assistant messages for Opus 4.6 compatibility
+- **Escaped JSON reverse mapping** — Handles `\"name\"` in SSE `input_json_delta` deltas
+- **CC tool stubs** — 5 fake Claude Code tools injected (Glob, Grep, Agent, NotebookEdit, TodoRead)
+- **CC identity string** — "You are Claude Code, Anthropic's official CLI for Claude."
 
 ## Requirements
 
 - **Node.js** 18+
 - **Claude Max or Pro subscription**
-- **Claude Code CLI** installed and authenticated
-- **OpenClaw** installed and running
-
-### Installing Claude Code CLI (if not already installed)
-
-```bash
-npm install -g @anthropic-ai/claude-code
-```
-
-Then authenticate with your Claude account:
-
-```bash
-claude auth login
-```
-
-This opens a browser window to sign in with your Claude Max/Pro account. Once authenticated, credentials are stored at `~/.claude/.credentials.json`. The proxy reads from this file.
-
-Verify it worked:
-
-```bash
-claude auth status
-# Should show: loggedIn: true, subscriptionType: max (or pro)
-```
+- **Claude Code CLI** installed and authenticated (`npm install -g @anthropic-ai/claude-code && claude auth login`)
 
 ## Quick Start
 
+### Native (macOS / Linux)
+
 ```bash
-# 1. Clone
-git clone https://github.com/sioakim/claude-proxy
+git clone https://github.com/sioakim/claude-proxy.git
 cd claude-proxy
-
-# 2. Run setup (auto-detects your config)
-node setup.js
-
-# 3. Start the proxy
-node proxy.js
-
-# 4. Update OpenClaw config
-# In ~/.openclaw/openclaw.json, change:
-#   "baseUrl": "https://api.anthropic.com"
-# to:
-#   "baseUrl": "http://127.0.0.1:18801"
-
-# 5. Restart your OpenClaw gateway
+node setup.js    # finds credentials, creates config.json
+node proxy.js    # starts on port 18801
 ```
+
+### Docker
+
+```bash
+git clone https://github.com/sioakim/claude-proxy.git
+cd claude-proxy
+cp .env.example .env
+# Edit .env: set OAUTH_TOKEN=sk-ant-... (from `claude auth status`)
+docker compose up -d
+```
+
+### OpenClaw Configuration
+
+Point OpenClaw at the proxy in `openclaw.json`:
+
+```json
+{
+  "models": {
+    "providers": {
+      "anthropic": {
+        "baseUrl": "http://127.0.0.1:18801"
+      }
+    }
+  }
+}
+```
+
+## Docker Deployment
+
+The included `docker-compose.yml` provides:
+
+- **Localhost-only binding** (`127.0.0.1`) — proxy never exposed externally
+- **Built-in health check** (30s interval, 3 retries)
+- **Log rotation** (10MB max, 3 files)
+- **Credential volume mount** (`~/.claude:/root/.claude:ro`)
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OAUTH_TOKEN` | *(none)* | OAuth token — overrides file-based credentials |
+| `PROXY_PORT` | `18801` | Proxy listen port |
+| `PROXY_HOST` | `127.0.0.1` | Bind address (Docker sets `0.0.0.0` automatically) |
+| `CLAUDE_CODE_ACCOUNT_UUID` | *(none)* | Account UUID for request metadata |
+
+Two auth modes:
+1. **Environment variable** — Set `OAUTH_TOKEN` in `.env` (no volume mount needed)
+2. **Credential file** — Mount `~/.claude` as read-only volume (default in docker-compose.yml)
 
 ## Configuration
 
-The `config.json` file (generated by setup or created manually):
+Optional `config.json` for custom rules:
 
 ```json
 {
   "port": 18801,
   "credentialsPath": "~/.claude/.credentials.json",
-  "replacements": [
-    ["OpenClaw", "OCPlatform"],
-    ["openclaw", "ocplatform"],
-    ["sessions_spawn", "create_task"],
-    ["sessions_list", "list_tasks"],
-    ["sessions_history", "get_history"],
-    ["sessions_send", "send_to_task"],
-    ["sessions_yield", "yield_task"],
-    ["running inside", "running on"]
-  ],
-  "reverseMap": [
-    ["OCPlatform", "OpenClaw"],
-    ["ocplatform", "openclaw"],
-    ["create_task", "sessions_spawn"],
-    ["list_tasks", "sessions_list"],
-    ["get_history", "sessions_history"],
-    ["send_to_task", "sessions_send"],
-    ["yield_task", "sessions_yield"]
-  ]
+  "stripSystemConfig": true,
+  "stripToolDescriptions": true,
+  "injectCCStubs": true,
+  "stripTrailingAssistantPrefill": true,
+  "replacements": [],
+  "reverseMap": [],
+  "toolRenames": [],
+  "propRenames": []
 }
 ```
 
-### Replacement Rules
-
-**`replacements`** -- Applied to outbound requests. Each `[find, replace]` pair does a raw string replacement on the request body before forwarding to the API.
-
-**`reverseMap`** -- Applied to inbound responses. Each `[sanitized, original]` pair restores terms back to their original form before returning to OpenClaw. This ensures tool names, file paths, and identifiers work correctly.
-
-**Important:** Use space-free replacements for lowercase `openclaw`. Replacing `.openclaw/` with `.assistant platform/` (with a space) breaks filesystem paths in tool calls. Use `ocplatform` or similar instead.
-
-### Adding New Patterns
-
-If your OpenClaw version has additional `sessions_*` tools (they add new ones across versions), add them to both `replacements` and `reverseMap`:
-
-```json
-{
-  "replacements": [
-    ["sessions_new_tool", "new_task_tool"]
-  ],
-  "reverseMap": [
-    ["new_task_tool", "sessions_new_tool"]
-  ]
-}
-```
-
-If you have a custom assistant name that Anthropic blocks (test by checking if requests fail with the name present but pass without it), add it the same way.
+| Option | Default | Description |
+|--------|---------|-------------|
+| `stripSystemConfig` | `true` | Remove ~35K OpenClaw config from system prompt |
+| `stripToolDescriptions` | `true` | Empty verbose tool descriptions |
+| `injectCCStubs` | `true` | Add 5 fake Claude Code tools |
+| `stripTrailingAssistantPrefill` | `true` | Strip trailing assistant messages (Opus 4.6 fix) |
+| `replacements` | 30 patterns | Custom string sanitization rules `[["find", "replace"], ...]` |
+| `toolRenames` | 29 renames | Custom tool name mappings |
+| `propRenames` | 8 renames | Custom property name mappings |
 
 ## Running as a Service
 
-### macOS (launchd) — Recommended
+### macOS (launchd)
 
-```bash
-cat > ~/Library/LaunchAgents/com.openclaw.billing-proxy.plist << 'EOF'
+```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>Label</key>
-    <string>com.openclaw.billing-proxy</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/opt/homebrew/bin/node</string>
-        <string>/path/to/proxy.js</string>
-    </array>
-    <key>WorkingDirectory</key>
-    <string>/path/to/claude-proxy</string>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/tmp/openclaw-billing-proxy.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/openclaw-billing-proxy.log</string>
+  <key>Label</key>
+  <string>com.openclaw.billing-proxy</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/node</string>
+    <string>/path/to/claude-proxy/proxy.js</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/openclaw-billing-proxy.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/openclaw-billing-proxy.log</string>
 </dict>
 </plist>
-EOF
+```
 
+```bash
+cp com.openclaw.billing-proxy.plist ~/Library/LaunchAgents/
 launchctl load ~/Library/LaunchAgents/com.openclaw.billing-proxy.plist
 ```
 
-To restart:
-```bash
-launchctl kickstart -k gui/$(id -u)/com.openclaw.billing-proxy
-```
-
 ### Linux (systemd)
-```bash
-sudo tee /etc/systemd/system/claude-proxy.service << EOF
+
+```ini
 [Unit]
-Description=Claude Proxy
+Description=Claude Billing Proxy
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/node /path/to/proxy.js
+ExecStart=/usr/bin/node /path/to/claude-proxy/proxy.js
 Restart=always
-User=YOUR_USER
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
-EOF
-
-sudo systemctl enable claude-proxy
-sudo systemctl start claude-proxy
-```
-
-### Windows (startup)
-Add to your `gateway.cmd` before the gateway launch:
-```cmd
-start "Billing Proxy" /min node "C:\path\to\proxy.js"
-timeout /t 2 /nobreak >nul
 ```
 
 ### PM2
+
 ```bash
 pm2 start proxy.js --name claude-proxy
 pm2 save
+pm2 startup
 ```
 
 ## Dashboard
 
-When running in a terminal, the proxy displays a real-time dashboard:
+The proxy includes a real-time terminal dashboard (when running in a TTY):
 
-```
-  Claude Proxy                  Port: 18801   Uptime: 2h 14m
-  Sub: max            Token: 7.7h remaining
-  5h [██████░░░░░░░░░] 40% 1h30m    7d [███░░░░░░░░░░░░] 20% 4d12h
-  ──────────────────────────────────────────────────────────────────
-                                       Input        Output
-  Today (2026-04-07)                     100         8,220   (46)
-  Yesterday                          283,094       211,779   (880)
-  ──────────────────────────────────────────────────────────────────
-  Total (2d)                         283,194       219,999   (926)
+- Request log with model tags (O=Opus, S=Sonnet, H=Haiku)
+- Token usage per request (input ↑ / output ↓)
+- Rate limit status bar
+- Daily/monthly usage tracking
 
-  RECENT ACTIVITY
-  S [14:32:07] #37 POST /v1/messages 200   ↑1,204    ↓389
-  O [14:31:55] #36 POST /v1/messages 200     ↑980    ↓201
+**Keyboard shortcuts:** `q` quit, `c` clear log, `r` refresh display
 
-  [i] info  [q] quit
-```
-
-- **Rate bars** -- 5h and 7d unified rate window utilization from response headers (green <50%, yellow 50–80%, red >80%) with countdown until each window resets
-- **Token table** -- Daily input/output token totals with up to 7 days of history
-- **Recent activity** -- Last 10 requests with model tag (S/H/O = Sonnet/Haiku/Opus), status, and token counts (↑ in, ↓ out)
-
-### Keyboard Shortcuts
-
-| Key | Action |
-|-----|--------|
-| `i` | Toggle info screen (explains every element) |
-| `q` | Quit the proxy |
-
-When stdout is not a TTY (e.g., piped or running as a service), the proxy falls back to plain text logging.
-
-### Usage Data
-
-Token usage is persisted to `./data/usage.json` and survives restarts. The file is updated with a 2-second debounce after each request and flushed on shutdown.
-
-```bash
-cat data/usage.json   # view raw usage data
-```
+Usage data persists to `~/.claude-proxy-usage.json`.
 
 ## Token Refresh
 
-Claude Code's OAuth token expires roughly every 8–24 hours. The proxy reads the token from `~/.claude/.credentials.json` on each request. If the token expires, all requests will 401.
+Claude Code OAuth tokens expire every ~8 hours.
 
-### The Problem (macOS)
-
-On macOS, Claude Code stores refreshed tokens in the **macOS Keychain** (`Claude Code-credentials`), but does not always write the updated token back to the credentials JSON file. This means the file goes stale while the Keychain has a valid token — and the proxy only reads the file.
-
-### Manual Refresh
-
-- Open Claude Code CLI briefly — it auto-refreshes on startup:
-  ```bash
-  claude --print "."
-  ```
-- Then sync the token from Keychain to the file (macOS only):
-  ```bash
-  security find-generic-password -s "Claude Code-credentials" -w > ~/.claude/.credentials.json
-  ```
-
-### Automated Refresh (Recommended)
-
-The included `refresh-token.sh` script handles the full refresh cycle:
-
-1. Runs `claude --print "."` to trigger Claude Code's internal OAuth refresh
-2. Reads the fresh token from macOS Keychain
-3. Writes it to `~/.claude/.credentials.json`
-4. Restarts the proxy via launchctl
+### Manual
 
 ```bash
-# Run manually
-./refresh-token.sh
-
-# Or schedule with cron (every 6 hours)
-crontab -e
-0 */6 * * * /path/to/claude-proxy/refresh-token.sh >> /tmp/refresh-token.log 2>&1
+claude --print "." && launchctl kickstart -k gui/$(id -u)/com.openclaw.billing-proxy
 ```
 
-**Environment variables:**
-- `CLAUDE_CREDENTIALS_PATH` — override credentials file path (default: `~/.claude/.credentials.json`)
-- `PROXY_PORT` — override proxy port for health check (default: `18801`)
+### Automated (cron)
 
-### Non-macOS Systems
+```bash
+# Every 6 hours
+0 */6 * * * /path/to/claude-proxy/refresh-token.sh >> /tmp/claude-proxy-refresh.log 2>&1
+```
 
-On Linux/Windows, Claude Code writes tokens directly to the credentials file, so the Keychain sync issue doesn't apply. A simple cron running `claude -p "ping" --max-turns 1 --no-session-persistence` is sufficient to keep the token fresh.
+The included `refresh-token.sh` script:
+1. Runs `claude --print "."` to trigger token refresh
+2. Syncs Keychain → credentials file
+3. Restarts the proxy via launchctl
 
 ## Health Check
 
@@ -295,89 +224,62 @@ On Linux/Windows, Claude Code writes tokens directly to the credentials file, so
 curl http://127.0.0.1:18801/health
 ```
 
-Returns token status, request count, uptime, subscription type, and pattern counts.
+Returns:
+```json
+{
+  "status": "ok",
+  "proxy": "claude-proxy",
+  "version": "2.1.0",
+  "requestsServed": 42,
+  "tokenExpiresInHours": "5.2",
+  "subscriptionType": "max",
+  "ccEmulation": {
+    "ccVersion": "2.1.97",
+    "deviceId": "f4da7011...",
+    "sessionId": "56a49b90..."
+  },
+  "layers": {
+    "stringReplacements": 30,
+    "toolNameRenames": 29,
+    "propertyRenames": 8,
+    "ccToolStubs": 5,
+    "systemStripEnabled": true,
+    "descriptionStripEnabled": true
+  }
+}
+```
 
-## How Anthropic's Detection Works
+## Security
 
-Anthropic uses two mechanisms to detect third-party tools:
-
-1. **Billing Header** -- The API checks the system prompt for `x-anthropic-billing-header`. Without it, OAuth requests go to Extra Usage. This is a simple string match on 84 characters injected by Claude Code's SDK.
-
-2. **Streaming Classifier** -- Anthropic's classifier scans the request for specific trigger phrases. The verified triggers are:
-   - `OpenClaw` (the platform name -- case insensitive)
-   - `sessions_spawn`, `sessions_list`, `sessions_history`, `sessions_send`, `sessions_yield`, `sessions_yield_interrupt`, `sessions_store` (OpenClaw session management tools -- new tools are added across versions)
-   - `HEARTBEAT_OK` (OpenClaw heartbeat ack identifier injected in system prompt)
-   - `running inside` + platform name (the self-declaration phrase OpenClaw injects)
-
-   If detected, the response is refused with `stop_reason: "refusal"` or a billing error.
-
-**What is NOT detected:** Assistant names, workspace filenames (AGENTS.md, SOUL.md), config paths (.openclaw/), plugin names (lossless-claw), individual non-session tool names (exec, lcm_grep, gateway, cron, etc.), bot names, or runtime references. Only the patterns above trigger rejection.
-
-## Why Reverse Mapping Matters
-
-Without reverse mapping, the model sees sanitized paths in its context (e.g., `.ocplatform/workspace/scripts/`) and uses them for tool calls. But the actual filesystem has `.openclaw/`. The reverse mapping translates API responses back to original terms before OpenClaw processes them, ensuring:
-
-- Tool names match OpenClaw's tool registry
-- File paths match the actual filesystem
-- Session management commands use correct identifiers
+- **File permissions** — Credentials written with `0o600` (owner-only read/write)
+- **Localhost binding** — Default `127.0.0.1`, never exposed externally
+- **Sanitized errors** — No credential data in error responses
+- **Body size limit** — `MAX_BODY_SIZE` prevents memory exhaustion
+- **Keychain integration** — macOS Keychain for credential storage with proactive sync
 
 ## Troubleshooting
 
-Run the diagnostic script to identify issues:
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `400 "out of extra usage"` | Detection triggered | Check proxy logs for `[STRIP]` messages — config template may have changed |
+| `400 "assistant message prefill"` | Opus 4.6 prefill rejection | Ensure `stripTrailingAssistantPrefill` is enabled (default) |
+| `400 "Input tag ImageGen"` | Content type collision | Already fixed in v2.1 — tool renames use `"name":"X"` prefix |
+| `400 "Extra inputs are not permitted"` | Metadata field rejected | Only `metadata.user_id` is allowed by the API |
+| `400 "maximum of 4 blocks with cache_control"` | Too many cache breakpoints | Reduce to identity block only |
+| Token expired | 8h OAuth expiry | Run `refresh-token.sh` or set up cron |
+| Empty responses | SSE reverse-map leak | Stream reverser with holdback handles chunk boundaries |
 
+Run diagnostics:
 ```bash
 node troubleshoot.js
 ```
 
-This tests 8 layers independently (credentials, token, API, billing header, trigger detection, proxy health, end-to-end) and tells you exactly what to fix.
-
-### Common Issues
-
-**"Could not find credentials file"**
-- Run `claude auth login` to authenticate (opens browser)
-- On Mac, the file may be at `~/.claude/credentials.json` (no dot prefix) -- the proxy checks both
-- If the file exists but is empty (0 bytes), run `claude auth logout && claude auth login`
-- If still empty on Mac, run `claude -p "test" --max-turns 1` to force a credential write to disk
-
-**Proxy returns 400**
-- The API is rejecting the request due to unsanitized trigger terms
-- Your OpenClaw version may have `sessions_*` tools not in the default list
-- Run `node setup.js` to auto-detect your tools, or manually add patterns to `config.json`
-- Check the proxy console output for the error message
-
-**"Third-party apps now draw from your extra usage"**
-- Same cause as 400 -- trigger terms not fully sanitized
-- Disable Extra Usage in your Claude settings to verify subscription billing
-- If it was working and stopped, new trigger terms may have appeared in your conversation history -- restart the OpenClaw gateway to clear the session
-
-**429 Rate Limit**
-- Normal if you have active Claude Code sessions sharing the rate bucket
-- Wait a few minutes and try again
-- Not a proxy issue
-
-**Token Expired**
-- Open Claude Code CLI briefly -- it auto-refreshes on startup
-- Or run: `claude -p "ping" --max-turns 1 --no-session-persistence`
-
-**Tool execution fails / wrong file paths**
-- If the model references `.ocplatform/` instead of `.openclaw/`, your `reverseMap` is missing entries
-- Ensure every `replacements` entry has a matching `reverseMap` entry
-- Use space-free replacements (e.g., `ocplatform`, NOT `assistant platform`) to avoid breaking filesystem paths
-
-**Empty credentials file on Mac / Token keeps expiring**
-- Claude Code stores refreshed tokens in macOS Keychain (`Claude Code-credentials`) but doesn't always update the JSON file
-- Run `./refresh-token.sh` to sync Keychain → file and restart the proxy
-- Or manually: `security find-generic-password -s "Claude Code-credentials" -w > ~/.claude/.credentials.json`
-- Set up the cron (see [Token Refresh](#token-refresh)) to prevent recurring expiry
-
-## Rollback
-
-Change `baseUrl` back to `https://api.anthropic.com` in `openclaw.json` and restart the gateway. Enable Extra Usage in your Claude settings if needed.
-
 ## Disclaimer
 
-This is an unofficial workaround. Anthropic may change their detection at any time. Use at your own risk. This proxy does not modify OpenClaw or Claude Code -- it's a transparent HTTP middleman.
+This proxy is provided as-is for personal use. It modifies API requests to use your existing Claude subscription for billing. Use at your own risk. The authors are not responsible for any account actions taken by Anthropic.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
+
+Based on [openclaw-billing-proxy](https://github.com/zacdcook/openclaw-billing-proxy) by [@zacdcook](https://github.com/zacdcook).
