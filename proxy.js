@@ -280,7 +280,8 @@ function loadConfig() {
     propRenames: config.propRenames || DEFAULT_PROP_RENAMES,
     stripSystemConfig: config.stripSystemConfig !== false,
     stripToolDescriptions: config.stripToolDescriptions !== false,
-    injectCCStubs: config.injectCCStubs !== false
+    injectCCStubs: config.injectCCStubs !== false,
+    stripTrailingAssistantPrefill: config.stripTrailingAssistantPrefill !== false
   };
 }
 
@@ -533,6 +534,26 @@ function processBody(bodyStr, config) {
     // Layer 8: Strip stale betas body field (API rejects it; betas are header-only)
     delete parsed.betas;
 
+    // Strip trailing assistant messages (prefill).
+    // OpenClaw sometimes pre-fills the next assistant turn to resume interrupted responses.
+    // Opus 4.6 disabled assistant prefill and returns 400:
+    //   "This model does not support assistant message prefill."
+    // The error is permanent for the session — every retry includes the same prefill.
+    // Strip ALL trailing assistant messages until the array ends with a user message.
+    // See: https://github.com/zacdcook/openclaw-billing-proxy/pull/17
+    if (config.stripTrailingAssistantPrefill !== false) {
+      if (Array.isArray(parsed.messages) && parsed.messages.length > 0) {
+        let popped = 0;
+        while (parsed.messages.length > 0 &&
+               parsed.messages[parsed.messages.length - 1].role === 'assistant') {
+          parsed.messages.pop();
+          popped++;
+        }
+        if (popped > 0) {
+          console.log(`[STRIP-PREFILL] Removed ${popped} trailing assistant message(s) (${parsed.messages.length} remain)`);
+        }
+      }
+    }
 
     return JSON.stringify(parsed);
   } catch (e) {
@@ -565,16 +586,23 @@ function processBody(bodyStr, config) {
 function reverseMap(text, config) {
   let result = text;
   // Reverse tool names first (use "name":"X" pattern to avoid clobbering content types)
+  // Handle BOTH plain JSON ("name":"X") AND escaped JSON inside string fields (\"name\":\"X\").
+  // SSE input_json_delta deltas put nested JSON inside a string field (partial_json),
+  // so the inner quotes are escaped. Without the escaped variant, tool_use args
+  // never get reverted and the OpenClaw tool runtime fails.
+  // See: https://github.com/zacdcook/openclaw-billing-proxy/pull/16
   if (config.toolRenames) {
     for (const [orig, cc] of config.toolRenames) {
       result = result.split('"name":"' + cc + '"').join('"name":"' + orig + '"');
       result = result.split('"name": "' + cc + '"').join('"name": "' + orig + '"');
+      result = result.split('\\"' + cc + '\\"').join('\\"' + orig + '\\"');
     }
   }
-  // Reverse property names
+  // Reverse property names — same dual handling (plain + escaped)
   if (config.propRenames) {
     for (const [orig, renamed] of config.propRenames) {
       result = result.split('"' + renamed + '"').join('"' + orig + '"');
+      result = result.split('\\"' + renamed + '\\"').join('\\"' + orig + '\\"');
     }
   }
   // Reverse string replacements
