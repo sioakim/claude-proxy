@@ -208,7 +208,7 @@ const DEFAULT_REVERSE_MAP = [
 function loadConfig() {
   const args = process.argv.slice(2);
   let configPath = null;
-  let port = DEFAULT_PORT;
+  let cliPort = null;
   let cacheEnabled = true;
 
   for (let i = 0; i < args.length; i++) {
@@ -223,15 +223,28 @@ function loadConfig() {
     if (args[i] === '--no-cache') cacheEnabled = false;
   }
 
+  const envPort = process.env.PROXY_PORT ? parseInt(process.env.PROXY_PORT) : null;
+
   let config = {};
   if (configPath && fs.existsSync(configPath)) {
-    config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    try { config = JSON.parse(fs.readFileSync(configPath, 'utf8')); } catch(e) {
+      console.error('[ERROR] Failed to parse config: ' + configPath + ' (' + e.message + ')');
+      process.exit(1);
+    }
   } else if (fs.existsSync('config.json')) {
-    config = JSON.parse(fs.readFileSync('config.json', 'utf8'));
+    try { config = JSON.parse(fs.readFileSync('config.json', 'utf8')); } catch(e) {
+      console.error('[PROXY] Warning: config.json is invalid, using defaults. (' + e.message + ')');
+    }
   }
 
   // Find Claude Code credentials
   const homeDir = os.homedir();
+  // OAUTH_TOKEN env var takes precedence over all file-based credentials
+  if (process.env.OAUTH_TOKEN) {
+    credsPath = 'env';
+    console.log('[PROXY] Using OAUTH_TOKEN from environment variable.');
+  }
+
   const credsPaths = [
     config.credentialsPath,
     path.join(homeDir, '.claude', '.credentials.json'),
@@ -239,12 +252,15 @@ function loadConfig() {
   ].filter(Boolean);
 
   let credsPath = null;
+
+  if (!credsPath) {
   for (const p of credsPaths) {
     const resolved = p.startsWith('~') ? path.join(homeDir, p.slice(1)) : p;
     if (fs.existsSync(resolved) && fs.statSync(resolved).size > 0) {
       credsPath = resolved;
       break;
     }
+  }
   }
 
   // macOS Keychain fallback: extract token and write to file
@@ -271,7 +287,7 @@ function loadConfig() {
   }
 
   return {
-    port: config.port || port,
+    port: envPort || cliPort || config.port || DEFAULT_PORT,
     credsPath,
     cacheEnabled,
     replacements: config.replacements || DEFAULT_REPLACEMENTS,
@@ -765,7 +781,8 @@ const dashboard = {
     this.isTTY = process.stdout.isTTY || false;
     if (!this.isTTY) {
       // Non-TTY fallback: plain text banner
-      const h = ((oauth.expiresAt - Date.now()) / 3600000).toFixed(1);
+      const expiresIn = (oauth.expiresAt - Date.now()) / 3600000;
+      const h = isFinite(expiresIn) ? expiresIn.toFixed(1) + 'h' : 'n/a (env var)';
       console.log(`\n  Claude Proxy v${VERSION}`);
       console.log(`  Port: ${config.port}  Sub: ${oauth.subscriptionType}  Token: ${h}h  Cache: ${config.cacheEnabled ? '1h TTL' : 'off'}`);
       console.log(`  CC Emulation: v${CC_VERSION}  Device: ${DEVICE_ID.slice(0, 8)}...  Session: ${SESSION_ID.slice(0, 8)}...`);
@@ -1247,7 +1264,8 @@ function startServer(config) {
     });
   });
 
-  server.listen(config.port, '127.0.0.1', () => {
+  const bindHost = process.env.PROXY_HOST || '127.0.0.1';
+  server.listen(config.port, bindHost, () => {
     if (process.platform === 'darwin') {
       if (!readKeychainToken()) {
         console.error('[PROXY] WARNING: macOS Keychain not readable. Automatic token refresh disabled.');
