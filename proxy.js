@@ -517,12 +517,9 @@ function processBody(bodyStr, config) {
       parsed.system = [billingObj, identityObj];
     }
 
-    // Layer 8: Request metadata injection
+    // Layer 8: Request metadata injection (only user_id is allowed by the API)
     if (!parsed.metadata) parsed.metadata = {};
     parsed.metadata.user_id = DEVICE_ID;
-    if (!parsed.metadata.device_id) parsed.metadata.device_id = DEVICE_ID;
-    if (!parsed.metadata.account_uuid) parsed.metadata.account_uuid = DEVICE_ID;
-    if (!parsed.metadata.session_id) parsed.metadata.session_id = SESSION_ID;
 
     // Layer 8: Temperature normalization
     const hasThinking = parsed.thinking && parsed.thinking.type === 'enabled';
