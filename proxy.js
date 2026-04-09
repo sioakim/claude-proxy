@@ -400,9 +400,14 @@ function processBody(bodyStr, config) {
     modified = modified.split(find).join(replace);
   }
 
-  // Layer 3: Tool name fingerprint bypass (quoted replacement for precision)
+  // Layer 3: Tool name fingerprint bypass
+  // Use "name":"X" pattern to avoid renaming content type tags (e.g. "type":"image")
+  // See: https://github.com/zacdcook/openclaw-billing-proxy/issues/14
   for (const [orig, cc] of config.toolRenames) {
-    modified = modified.split('"' + orig + '"').join('"' + cc + '"');
+    // Rename tool names: "name":"exec" -> "name":"Bash"
+    modified = modified.split('"name":"' + orig + '"').join('"name":"' + cc + '"');
+    // Also handle tool_use blocks: "name": "exec" (with space after colon)
+    modified = modified.split('"name": "' + orig + '"').join('"name": "' + cc + '"');
   }
 
   // Layer 6: Property name renaming
@@ -559,10 +564,11 @@ function processBody(bodyStr, config) {
 // ─── Response Processing ────────────────────────────────────────────────────
 function reverseMap(text, config) {
   let result = text;
-  // Reverse tool names first (more specific patterns)
+  // Reverse tool names first (use "name":"X" pattern to avoid clobbering content types)
   if (config.toolRenames) {
     for (const [orig, cc] of config.toolRenames) {
-      result = result.split('"' + cc + '"').join('"' + orig + '"');
+      result = result.split('"name":"' + cc + '"').join('"name":"' + orig + '"');
+      result = result.split('"name": "' + cc + '"').join('"name": "' + orig + '"');
     }
   }
   // Reverse property names
@@ -586,11 +592,13 @@ function maxPatternLen(config) {
   for (const [sanitized] of config.reverseMap) {
     if (sanitized.length > max) max = sanitized.length;
   }
-  // Also consider renamed tool/prop names (they appear in responses wrapped in quotes)
+  // Also consider renamed tool/prop names (they appear in responses as "name":"X")
   if (config.toolRenames) {
     for (const [, cc] of config.toolRenames) {
-      const quoted = '"' + cc + '"';
+      const quoted = '"name":"' + cc + '"';
       if (quoted.length > max) max = quoted.length;
+      const quotedSpaced = '"name": "' + cc + '"';
+      if (quotedSpaced.length > max) max = quotedSpaced.length;
     }
   }
   if (config.propRenames) {
