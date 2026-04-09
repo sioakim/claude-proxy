@@ -1,9 +1,0 @@
-@@ -59,7 +59,7 @@
- function computeBillingFingerprint(firstUserMessage, version) {
-   const chars = BILLING_HASH_INDICES.map(i => (firstUserMessage || '')[i] || '0').join('');
-   const input = `${BILLING_HASH_SALT}${chars}${version}`;
--  return BILLING_HASH_INDICES.map(i => hash[i]).join('');
-+  return crypto.createHash('sha256').update(input).digest('hex').slice(0, 3);
- }
- 
- function extractFirstUserMessageText(bodyStr) {
