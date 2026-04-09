@@ -528,33 +528,6 @@ function processBody(bodyStr, config) {
     // Layer 8: Strip stale betas body field (API rejects it; betas are header-only)
     delete parsed.betas;
 
-    // Add cache_control breakpoints (1h TTL) for prompt caching
-    if (config.cacheEnabled) {
-      // Last system block
-      if (Array.isArray(parsed.system) && parsed.system.length > 0) {
-        parsed.system[parsed.system.length - 1].cache_control = CACHE_1H;
-      }
-
-      // Last tool
-      if (Array.isArray(parsed.tools) && parsed.tools.length > 0) {
-        parsed.tools[parsed.tools.length - 1].cache_control = CACHE_1H;
-      }
-
-      // Last user message (caches entire conversation history)
-      if (Array.isArray(parsed.messages)) {
-        for (let i = parsed.messages.length - 1; i >= 0; i--) {
-          if (parsed.messages[i].role === 'user') {
-            const msg = parsed.messages[i];
-            if (Array.isArray(msg.content) && msg.content.length > 0) {
-              msg.content[msg.content.length - 1].cache_control = CACHE_1H;
-            } else if (typeof msg.content === 'string') {
-              msg.content = [{ type: 'text', text: msg.content, cache_control: CACHE_1H }];
-            }
-            break;
-          }
-        }
-      }
-    }
 
     return JSON.stringify(parsed);
   } catch (e) {
