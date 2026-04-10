@@ -434,13 +434,74 @@ function findMatchingBracket(str, start) {
   return -1;
 }
 
+// ─── Thinking Block Preservation ────────────────────────────────────────────
+// When extended thinking is enabled, Anthropic requires thinking blocks to be
+// returned verbatim on subsequent turns. String replacements/renames that mutate
+// thinking block content cause rejection. These helpers replace thinking and
+// redacted_thinking content blocks with unique placeholders before transforms,
+// then restore them afterwards.
+
+function maskThinkingBlocks(bodyStr) {
+  const store = [];
+  // Match "type":"thinking" and "type":"redacted_thinking" content blocks
+  // These appear in messages[].content arrays from prior assistant turns
+  const pattern = /\{"type":"(?:thinking|redacted_thinking)"[^}]*?"(?:thinking|data)":"(?:[^"\\]|\\.)*"[^}]*?\}/g;
+  const masked = bodyStr.replace(pattern, (match) => {
+    const id = `__THINKING_PLACEHOLDER_${store.length}__`;
+    store.push({ id, original: match });
+    return `"${id}"`;
+  });
+  return { masked, store };
+}
+
+function unmaskThinkingBlocks(bodyStr, store) {
+  let result = bodyStr;
+  for (const { id, original } of store) {
+    result = result.split(`"${id}"`).join(original);
+  }
+  return result;
+}
+
+// Check if a request body has thinking enabled
+function hasThinkingEnabled(bodyStr) {
+  return /"type"\s*:\s*"(?:adaptive|enabled)"/.test(bodyStr) &&
+         /"thinking"\s*:\s*\{/.test(bodyStr);
+}
+
+// ─── SSE Thinking Event Detection ──────────────────────────────────────────
+// Detects thinking_delta and content_block_start/stop for thinking blocks
+// in SSE streams, passing them through unchanged.
+function isThinkingSSEEvent(eventStr) {
+  // thinking content_block_delta events
+  if (eventStr.includes('"thinking_delta"') || eventStr.includes('"thinking"')) {
+    if (eventStr.includes('content_block_delta') || eventStr.includes('content_block_start') || eventStr.includes('content_block_stop')) {
+      return true;
+    }
+  }
+  // redacted_thinking blocks
+  if (eventStr.includes('"redacted_thinking"')) return true;
+  return false;
+}
+
 // ─── Request Processing ─────────────────────────────────────────────────────
 // BILLING_OBJ removed — now uses dynamic buildBillingBlock()
 const CACHE_1H = { type: 'ephemeral', ttl: '1h' };
 
 function processBody(bodyStr, config) {
-  // Layer 2: String trigger sanitization (global split/join)
+  // Thinking block preservation: mask thinking blocks before any transforms
+  const thinkingActive = hasThinkingEnabled(bodyStr);
+  let thinkingStore = [];
   let modified = bodyStr;
+  if (thinkingActive) {
+    const masked = maskThinkingBlocks(modified);
+    modified = masked.masked;
+    thinkingStore = masked.store;
+    if (thinkingStore.length > 0) {
+      console.log(`[THINKING] Masked ${thinkingStore.length} thinking block(s) before transforms`);
+    }
+  }
+
+  // Layer 2: String trigger sanitization (global split/join)
   for (const [find, replace] of config.replacements) {
     modified = modified.split(find).join(replace);
   }
@@ -544,6 +605,11 @@ function processBody(bodyStr, config) {
       const insertAt = toolsIdx + '"tools":['.length;
       modified = modified.slice(0, insertAt) + CC_TOOL_STUBS.join(',') + ',' + modified.slice(insertAt);
     }
+  }
+
+  // Restore thinking blocks after string transforms, before JSON parse
+  if (thinkingActive && thinkingStore.length > 0) {
+    modified = unmaskThinkingBlocks(modified, thinkingStore);
   }
 
   // 2. Parse JSON for structured modifications (billing + cache_control)
@@ -1244,13 +1310,38 @@ function startServer(config) {
           res.writeHead(upRes.statusCode, upRes.headers);
           const tracker = createSSETokenTracker();
           const reverser = createStreamReverser(config);
+          let ssePending = ''; // buffer for splitting SSE events
           upRes.on('data', (chunk) => {
             const raw = chunk.toString();
             tracker.push(raw);
-            const out = reverser.write(raw);
-            if (out) res.write(out);
+
+            // Split into complete SSE events to detect thinking blocks
+            ssePending += raw;
+            const events = ssePending.split('\n\n');
+            ssePending = events.pop(); // last element may be incomplete
+
+            for (const evt of events) {
+              const evtWithDelim = evt + '\n\n';
+              if (isThinkingSSEEvent(evt)) {
+                // Pass thinking events through unchanged — no reverse mapping
+                reverser.write(''); // keep reverser in sync (empty input)
+                res.write(evtWithDelim);
+              } else {
+                const out = reverser.write(evtWithDelim);
+                if (out) res.write(out);
+              }
+            }
           });
           upRes.on('end', () => {
+            // Flush any remaining partial event
+            if (ssePending) {
+              if (isThinkingSSEEvent(ssePending)) {
+                res.write(ssePending);
+              } else {
+                const out = reverser.write(ssePending);
+                if (out) res.write(out);
+              }
+            }
             const tail = reverser.flush();
             if (tail) res.write(tail);
             dashboard.logRequest(reqNum, req.method, req.url, upRes.statusCode, tracker.inputTokens, tracker.outputTokens, modelTag);
@@ -1277,7 +1368,17 @@ function startServer(config) {
               }
             } catch (e) { /* non-JSON or error response */ }
 
+            // Preserve thinking blocks in non-streaming responses
+            let respThinkingStore = [];
+            if (hasThinkingEnabled(bodyStr)) {
+              const masked = maskThinkingBlocks(respBody);
+              respBody = masked.masked;
+              respThinkingStore = masked.store;
+            }
             respBody = reverseMap(respBody, config);
+            if (respThinkingStore.length > 0) {
+              respBody = unmaskThinkingBlocks(respBody, respThinkingStore);
+            }
             const newHeaders = { ...upRes.headers };
             newHeaders['content-length'] = Buffer.byteLength(respBody);
             res.writeHead(upRes.statusCode, newHeaders);
