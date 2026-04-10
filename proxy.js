@@ -509,7 +509,7 @@ function processBody(bodyStr, config) {
   // Layer 3: Tool name fingerprint bypass
   // Use "name":"X" pattern to avoid renaming content type tags (e.g. "type":"image")
   // See: https://github.com/zacdcook/openclaw-billing-proxy/issues/14
-  for (const [orig, cc] of config.toolRenames) {
+  for (const [orig, cc] of (config.toolRenames || [])) {
     // Rename tool names: "name":"exec" -> "name":"Bash"
     modified = modified.split('"name":"' + orig + '"').join('"name":"' + cc + '"');
     // Also handle tool_use blocks: "name": "exec" (with space after colon)
@@ -517,7 +517,7 @@ function processBody(bodyStr, config) {
   }
 
   // Layer 6: Property name renaming
-  for (const [orig, renamed] of config.propRenames) {
+  for (const [orig, renamed] of (config.propRenames || [])) {
     modified = modified.split('"' + orig + '"').join('"' + renamed + '"');
   }
 

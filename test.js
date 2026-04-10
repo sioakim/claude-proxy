@@ -39,7 +39,7 @@ const {
   dashboard,
   fmt,
   USAGE_FILE,
-  BILLING_BLOCK,
+  buildBillingBlock,
   REQUIRED_BETAS,
   DEFAULT_REPLACEMENTS,
   DEFAULT_REVERSE_MAP,
@@ -339,7 +339,7 @@ describe('Feature: Request Body Processing', () => {
       assert.ok(result.includes('x-anthropic-billing-header'));
       const parsed = JSON.parse(result);
       assert.ok(Array.isArray(parsed.system));
-      assert.equal(parsed.system.length, 2);
+      assert.equal(parsed.system.length, 3);
     });
 
     it('should create system field when missing', () => {
@@ -889,19 +889,21 @@ describe('Feature: Number Formatting (fmt)', () => {
 
 describe('Feature: Configuration Constants', () => {
 
-  describe('Scenario: BILLING_BLOCK', () => {
-    it('should be valid JSON', () => {
-      const parsed = JSON.parse(BILLING_BLOCK);
-      assert.equal(parsed.type, 'text');
-      assert.ok(parsed.text.includes('x-anthropic-billing-header'));
+  describe('Scenario: buildBillingBlock', () => {
+    it('should return valid object with routing config', () => {
+      const block = buildBillingBlock('test message');
+      assert.equal(block.type, 'text');
+      assert.ok(block.text.includes('x-anthropic-billing-header'));
     });
 
-    it('should contain cc_version', () => {
-      assert.ok(BILLING_BLOCK.includes('cc_version'));
+    it('should contain rt_version', () => {
+      const block = buildBillingBlock('test message');
+      assert.ok(block.text.includes('cc_version'));
     });
 
     it('should contain cc_entrypoint', () => {
-      assert.ok(BILLING_BLOCK.includes('cc_entrypoint'));
+      const block = buildBillingBlock('test message');
+      assert.ok(block.text.includes('cc_entrypoint'));
     });
   });
 
