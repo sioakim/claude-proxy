@@ -286,14 +286,30 @@ function loadConfig() {
     process.exit(1);
   }
 
+  // Merge config arrays with defaults (config entries override by first element match).
+  // Set config.mergeDefaults = false to use config arrays as-is (old behavior).
+  const shouldMerge = config.mergeDefaults !== false;
+
+  function mergeArrayPairs(defaults, overrides) {
+    if (!overrides) return defaults;
+    if (!shouldMerge) return overrides;
+    const merged = [...defaults];
+    for (const entry of overrides) {
+      const idx = merged.findIndex(d => d[0] === entry[0]);
+      if (idx !== -1) merged[idx] = entry;
+      else merged.push(entry);
+    }
+    return merged;
+  }
+
   return {
     port: envPort || cliPort || config.port || DEFAULT_PORT,
     credsPath,
     cacheEnabled,
-    replacements: config.replacements || DEFAULT_REPLACEMENTS,
-    reverseMap: config.reverseMap || DEFAULT_REVERSE_MAP,
-    toolRenames: config.toolRenames || DEFAULT_TOOL_RENAMES,
-    propRenames: config.propRenames || DEFAULT_PROP_RENAMES,
+    replacements: mergeArrayPairs(DEFAULT_REPLACEMENTS, config.replacements),
+    reverseMap: mergeArrayPairs(DEFAULT_REVERSE_MAP, config.reverseMap),
+    toolRenames: mergeArrayPairs(DEFAULT_TOOL_RENAMES, config.toolRenames),
+    propRenames: mergeArrayPairs(DEFAULT_PROP_RENAMES, config.propRenames),
     stripSystemConfig: config.stripSystemConfig !== false,
     stripToolDescriptions: config.stripToolDescriptions !== false,
     injectCCStubs: config.injectCCStubs !== false,
