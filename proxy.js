@@ -42,7 +42,7 @@ const crypto = require('crypto');
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.1.0';
+const VERSION = '2.2.4';
 const USAGE_FILE = path.join(__dirname, 'data', 'usage.json');
 
 // ─── Layer 8: Claude Code Identity & Billing ───────────────────────
@@ -1491,6 +1491,10 @@ module.exports = {
   CC_TOOL_STUBS,
   VERSION,
   findMatchingBracket,
+  maskThinkingBlocks,
+  unmaskThinkingBlocks,
+  hasThinkingEnabled,
+  isThinkingSSEEvent,
   _usageData: () => usageData,
   _resetUsageData: () => { usageData = { version: 1, days: {} }; },
 };
