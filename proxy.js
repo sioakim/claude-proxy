@@ -472,7 +472,19 @@ function processBody(bodyStr, config) {
       if (stripFrom >= 2 && modified[stripFrom - 2] === '\\' && modified[stripFrom - 1] === 'n') {
         stripFrom -= 2;
       }
-      const configEnd = modified.indexOf('AGENTS.md', configStart);
+      // Use filesystem path header patterns as boundary landmark.
+      // "AGENTS.md" can appear in skill content; \n## / (Unix) or \n## C:\ (Windows)
+      // only appear in workspace doc headers injected by the platform.
+      let configEnd = -1;
+      const unixBoundary = modified.indexOf('\\n## /', configStart);
+      const winBoundary = modified.indexOf('\\n## C:\\\\', configStart);
+      if (unixBoundary !== -1 && (winBoundary === -1 || unixBoundary < winBoundary)) {
+        configEnd = unixBoundary + 3; // point past \n to the ##
+      } else if (winBoundary !== -1) {
+        configEnd = winBoundary + 3;
+      }
+      // Fallback to AGENTS.md if path patterns not found
+      if (configEnd === -1) configEnd = modified.indexOf('AGENTS.md', configStart);
       if (configEnd !== -1) {
         let boundary = configEnd;
         for (let i = configEnd - 1; i > stripFrom; i--) {
