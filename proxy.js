@@ -399,9 +399,18 @@ function getToken(credsPath) {
 // ─── Helper ─────────────────────────────────────────────────────────────────
 function findMatchingBracket(str, start) {
   let d = 0;
+  let inString = false;
   for (let i = start; i < str.length; i++) {
-    if (str[i] === '[') d++;
-    else if (str[i] === ']') { d--; if (d === 0) return i; }
+    const ch = str[i];
+    if (inString) {
+      // Skip escaped characters inside strings (including \")
+      if (ch === '\\') { i++; continue; }
+      if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') { inString = true; continue; }
+    if (ch === '[') d++;
+    else if (ch === ']') { d--; if (d === 0) return i; }
   }
   return -1;
 }
@@ -435,8 +444,10 @@ function processBody(bodyStr, config) {
   // Layer 4: System prompt template bypass
   // Strip the OC config section (~28K) between identity line and first workspace doc
   if (config.stripSystemConfig) {
+    // Anchor to system array start for reliable stripping
+    const sysArrayStart = modified.indexOf('"system":[');
     const IDENTITY_MARKER = 'You are a personal assistant';
-    const configStart = modified.indexOf(IDENTITY_MARKER);
+    const configStart = sysArrayStart !== -1 ? modified.indexOf(IDENTITY_MARKER, sysArrayStart) : modified.indexOf(IDENTITY_MARKER);
     if (configStart !== -1) {
       let stripFrom = configStart;
       if (stripFrom >= 2 && modified[stripFrom - 2] === '\\' && modified[stripFrom - 1] === 'n') {
