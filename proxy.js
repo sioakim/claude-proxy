@@ -154,7 +154,10 @@ const DEFAULT_TOOL_RENAMES = [
   ['lcm_expand', 'ContextExpand'],
   ['sessions_yield', 'TaskYield'],
   ['sessions_store', 'TaskStore'],
-  ['sessions_yield_interrupt', 'TaskYieldInterrupt']
+  ['sessions_yield_interrupt', 'TaskYieldInterrupt'],
+  ['image_generate', 'ImageCreate'],
+  ['music_generate', 'MusicCreate'],
+  ['video_generate', 'VideoCreate']
 ];
 
 // ─── Layer 6: Property Name Renames ─────────────────────────────────────────
