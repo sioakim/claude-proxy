@@ -38,11 +38,12 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
+const { StringDecoder } = require('string_decoder');
 
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.2.4';
+const VERSION = '2.2.5';
 const USAGE_FILE = path.join(__dirname, 'data', 'usage.json');
 
 // ─── Layer 8: Claude Code Identity & Billing ───────────────────────
@@ -1307,12 +1308,19 @@ function startServer(config) {
 
         // For SSE streaming responses, extract tokens + reverse-map each chunk
         if (upRes.headers['content-type'] && upRes.headers['content-type'].includes('text/event-stream')) {
-          res.writeHead(upRes.statusCode, upRes.headers);
+          const sseHeaders = { ...upRes.headers };
+          delete sseHeaders['content-length'];      // SSE is streamed, no fixed length
+          delete sseHeaders['transfer-encoding'];   // avoid header conflicts
+          res.writeHead(upRes.statusCode, sseHeaders);
           const tracker = createSSETokenTracker();
           const reverser = createStreamReverser(config);
+          // StringDecoder buffers incomplete UTF-8 sequences across TCP chunks.
+          // chunk.toString() would emit U+FFFD whenever a multi-byte char (emoji,
+          // CJK, etc.) lands on a chunk boundary.
+          const decoder = new StringDecoder('utf8');
           let ssePending = ''; // buffer for splitting SSE events
           upRes.on('data', (chunk) => {
-            const raw = chunk.toString();
+            const raw = decoder.write(chunk);
             tracker.push(raw);
 
             // Split into complete SSE events to detect thinking blocks
@@ -1333,6 +1341,9 @@ function startServer(config) {
             }
           });
           upRes.on('end', () => {
+            // Flush any remaining bytes from StringDecoder
+            const decoderRemainder = decoder.end();
+            if (decoderRemainder) ssePending += decoderRemainder;
             // Flush any remaining partial event
             if (ssePending) {
               if (isThinkingSSEEvent(ssePending)) {
@@ -1380,6 +1391,7 @@ function startServer(config) {
               respBody = unmaskThinkingBlocks(respBody, respThinkingStore);
             }
             const newHeaders = { ...upRes.headers };
+            delete newHeaders['transfer-encoding']; // avoid conflict with content-length
             newHeaders['content-length'] = Buffer.byteLength(respBody);
             res.writeHead(upRes.statusCode, newHeaders);
             res.end(respBody);
