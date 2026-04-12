@@ -1364,10 +1364,46 @@ function startServer(config) {
           });
         }
         // For JSON responses (errors, non-streaming), extract tokens + buffer and reverse-map
+        // For JSON responses (errors, non-streaming), extract tokens + buffer and reverse-map.
+        // Some upstream proxies (e.g. CLIProxyAPI with nonstream-keepalive-interval)
+        // inject blank-line heartbeat bytes during long-running inference so clients
+        // don't time out. We forward leading ASCII whitespace immediately to keep
+        // the client alive, then buffer actual JSON content for reverseMap.
+        // See: https://github.com/zacdcook/openclaw-billing-proxy/pull/40
         else {
+          let seenRealContent = false;
+          let headersWritten = false;
           const respChunks = [];
-          upRes.on('data', (c) => respChunks.push(c));
+          const ensureHeaders = () => {
+            if (headersWritten) return;
+            const nh = { ...upRes.headers };
+            delete nh['content-length'];
+            delete nh['transfer-encoding'];
+            try { res.writeHead(status, nh); headersWritten = true; } catch (e) {}
+          };
+          upRes.on('data', (c) => {
+            if (!seenRealContent) {
+              // Forward leading whitespace bytes (heartbeat keepalives) immediately
+              let i = 0;
+              while (i < c.length) {
+                const b = c[i];
+                if (b === 0x20 || b === 0x09 || b === 0x0a || b === 0x0d) { i++; }
+                else { break; }
+              }
+              if (i > 0) {
+                ensureHeaders();
+                try { res.write(c.subarray(0, i)); } catch (e) {}
+              }
+              if (i < c.length) {
+                seenRealContent = true;
+                respChunks.push(c.subarray(i));
+              }
+            } else {
+              respChunks.push(c);
+            }
+          });
           upRes.on('end', () => {
+            ensureHeaders();
             let respBody = Buffer.concat(respChunks).toString();
 
             // Extract token usage before reverse mapping
@@ -1394,11 +1430,7 @@ function startServer(config) {
             if (respThinkingStore.length > 0) {
               respBody = unmaskThinkingBlocks(respBody, respThinkingStore);
             }
-            const newHeaders = { ...upRes.headers };
-            delete newHeaders['transfer-encoding']; // avoid conflict with content-length
-            newHeaders['content-length'] = Buffer.byteLength(respBody);
-            res.writeHead(upRes.statusCode, newHeaders);
-            res.end(respBody);
+            try { res.write(respBody); res.end(); } catch (e) {}
 
             dashboard.logRequest(reqNum, req.method, req.url, upRes.statusCode, inputTokens, outputTokens, modelTag);
           });
