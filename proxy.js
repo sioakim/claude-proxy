@@ -43,7 +43,7 @@ const { StringDecoder } = require('string_decoder');
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.2.6';
+const VERSION = '2.2.7';
 const USAGE_FILE = path.join(__dirname, 'data', 'usage.json');
 
 // ─── Layer 8: Claude Code Identity & Billing ───────────────────────
@@ -143,6 +143,12 @@ const DEFAULT_TOOL_RENAMES = [
   ['sessions_spawn', 'TaskCreate'],
   ['subagents', 'AgentControl'],
   ['session_status', 'StatusCheck'],
+  ['read', 'Read'],
+  ['write', 'Write'],
+  ['edit', 'Edit'],
+  ['grep', 'Grep'],
+  ['glob', 'Glob'],
+  ['ls', 'LS'],
   ['web_search', 'WebSearch'],
   ['web_fetch', 'WebFetch'],
   ['image', 'ImageGen'],
@@ -663,8 +669,16 @@ function processBody(bodyStr, config) {
           from = vs + 1;
         }
         if (config.injectCCStubs) {
-          const insertAt = '"tools":['.length;
-          section = section.slice(0, insertAt) + CC_TOOL_STUBS.join(',') + ',' + section.slice(insertAt);
+          // Dedupe: skip stubs whose name matches a toolRename target (issue #43)
+          const renamedTargets = new Set((config.toolRenames || []).map(([, cc]) => cc));
+          const filteredStubs = CC_TOOL_STUBS.filter(s => {
+            const m = s.match(/"name":"([^"]+)"/);
+            return m ? !renamedTargets.has(m[1]) : true;
+          });
+          if (filteredStubs.length > 0) {
+            const insertAt = '"tools":['.length;
+            section = section.slice(0, insertAt) + filteredStubs.join(',') + ',' + section.slice(insertAt);
+          }
         }
         modified = modified.slice(0, toolsIdx) + section + modified.slice(toolsEndIdx + 1);
       }
@@ -672,8 +686,16 @@ function processBody(bodyStr, config) {
   } else if (config.injectCCStubs) {
     const toolsIdx = modified.indexOf('"tools":[');
     if (toolsIdx !== -1) {
-      const insertAt = toolsIdx + '"tools":['.length;
-      modified = modified.slice(0, insertAt) + CC_TOOL_STUBS.join(',') + ',' + modified.slice(insertAt);
+      // Dedupe: skip stubs whose name matches a toolRename target (issue #43)
+      const renamedTargets = new Set((config.toolRenames || []).map(([, cc]) => cc));
+      const filteredStubs = CC_TOOL_STUBS.filter(s => {
+        const m = s.match(/"name":"([^"]+)"/);
+        return m ? !renamedTargets.has(m[1]) : true;
+      });
+      if (filteredStubs.length > 0) {
+        const insertAt = toolsIdx + '"tools":['.length;
+        modified = modified.slice(0, insertAt) + filteredStubs.join(',') + ',' + modified.slice(insertAt);
+      }
     }
   }
 
