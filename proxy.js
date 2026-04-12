@@ -769,8 +769,12 @@ function createStreamReverser(config) {
     write(chunk) {
       pending += chunk;
       if (pending.length <= holdBack) return '';
-      const safe = pending.slice(0, pending.length - holdBack);
-      pending = pending.slice(pending.length - holdBack);
+      let sliceIdx = pending.length - holdBack;
+      // Prefer newline-aligned slicing for SSE (defense-in-depth)
+      const lastNl = pending.lastIndexOf('\n', sliceIdx);
+      if (lastNl >= 0) sliceIdx = lastNl + 1;
+      const safe = pending.slice(0, sliceIdx);
+      pending = pending.slice(sliceIdx);
       return reverseMap(safe, config);
     },
     // Flush remaining buffer (call on stream end).
