@@ -43,7 +43,7 @@ const { StringDecoder } = require('string_decoder');
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.2.5';
+const VERSION = '2.2.6';
 const USAGE_FILE = path.join(__dirname, 'data', 'usage.json');
 
 // ─── Layer 8: Claude Code Identity & Billing ───────────────────────
@@ -317,7 +317,10 @@ function loadConfig() {
     stripSystemConfig: config.stripSystemConfig !== false,
     stripToolDescriptions: config.stripToolDescriptions !== false,
     injectCCStubs: config.injectCCStubs !== false,
-    stripTrailingAssistantPrefill: config.stripTrailingAssistantPrefill !== false
+    stripTrailingAssistantPrefill: config.stripTrailingAssistantPrefill !== false,
+    refreshEnabled: config.refreshEnabled !== false,
+    refreshThresholdMs: (config.refreshThresholdMinutes || DEFAULT_REFRESH_THRESHOLD_MINUTES) * 60 * 1000,
+    refreshRetryMs: (config.refreshRetrySeconds || DEFAULT_REFRESH_RETRY_SECONDS) * 1000
   };
 }
 
@@ -325,6 +328,11 @@ function loadConfig() {
 const KEYCHAIN_SERVICE_NAMES = ['Claude Code-credentials', 'claude-code', 'claude', 'com.anthropic.claude-code'];
 const TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000;        // refresh when token has < 5 min left
 const PROACTIVE_SYNC_TRIGGER_MS = 30 * 60 * 1000;     // skip Keychain probe if > 30 min remaining
+
+// Periodic credential refresh defaults (overridable via config.json)
+const DEFAULT_REFRESH_THRESHOLD_MINUTES = 2;
+const DEFAULT_REFRESH_RETRY_SECONDS = 15;
+const CLAUDE_CLI_REFRESH_TIMEOUT_MS = 30000;
 
 let _cachedKeychainServiceName = null; // remember which service name worked
 
@@ -414,6 +422,67 @@ function getToken(credsPath) {
     console.error(`[PROXY] Token expired ${expiredAgo}m ago. Run "claude auth login" to refresh.`);
   }
   return oauth;
+}
+
+// ─── Periodic Credential Refresh ────────────────────────────────────────────
+// Checks token expiry and refreshes via Claude CLI + Keychain re-extraction.
+// See: https://github.com/zacdcook/openclaw-billing-proxy/pull/32
+function refreshCredentials(credsPath) {
+  if (credsPath === 'env') return false;
+  const { execSync } = require('child_process');
+
+  // Step 1: Trigger Claude CLI to refresh the underlying credential store
+  try {
+    execSync('claude -p "ping" --max-turns 1 --no-session-persistence', {
+      timeout: CLAUDE_CLI_REFRESH_TIMEOUT_MS,
+      stdio: 'pipe'
+    });
+  } catch(e) {
+    console.error('[PROXY] claude CLI refresh failed: ' + (e.message || 'unknown'));
+    // Continue anyway — Keychain may still have a fresh token from elsewhere
+  }
+
+  // Step 2: On macOS, re-extract from Keychain into the snapshot file
+  if (process.platform === 'darwin') {
+    const creds = readKeychainToken();
+    if (creds && creds.claudeAiOauth && creds.claudeAiOauth.accessToken) {
+      fs.mkdirSync(path.dirname(credsPath), { recursive: true });
+      fs.writeFileSync(credsPath, JSON.stringify(creds), { mode: 0o600 });
+      return true;
+    }
+  }
+
+  // Step 3: Verify file is readable and fresh
+  try { getToken(credsPath); return true; } catch(e) { return false; }
+}
+
+// Returns 'retry' if the caller should re-check quickly (e.g. refresh was a
+// no-op because the Claude CLI declined to rotate), 'ok' otherwise.
+function maybeRefreshCredentials(config) {
+  if (!config.refreshEnabled || config.credsPath === 'env') return 'ok';
+  try {
+    const oauth = getToken(config.credsPath);
+    const remainingMs = oauth.expiresAt - Date.now();
+    if (remainingMs > config.refreshThresholdMs) return 'ok';
+    const remainingMin = (remainingMs / 60000).toFixed(1);
+    console.log('[PROXY] Token expires in ' + remainingMin + 'm, refreshing...');
+    if (!refreshCredentials(config.credsPath)) {
+      console.error('[PROXY] Token refresh failed — run `claude auth login` manually');
+      return 'retry';
+    }
+    const newOauth = getToken(config.credsPath);
+    if (newOauth.expiresAt <= oauth.expiresAt) {
+      const newMin = ((newOauth.expiresAt - Date.now()) / 60000).toFixed(1);
+      console.log('[PROXY] Token refresh was a no-op (still ' + newMin + 'm), retrying shortly');
+      return 'retry';
+    }
+    const newHours = ((newOauth.expiresAt - Date.now()) / 3600000).toFixed(1);
+    console.log('[PROXY] Token refreshed, now expires in ' + newHours + 'h');
+    return 'ok';
+  } catch(e) {
+    console.error('[PROXY] Refresh check error: ' + e.message);
+    return 'ok';
+  }
 }
 
 // ─── Helper ─────────────────────────────────────────────────────────────────
@@ -1486,6 +1555,29 @@ function startServer(config) {
     } catch (e) {
       console.error(`  Started on port ${config.port} but credentials error: ${e.message}`);
     }
+
+    // Periodic credential refresh via Claude CLI + Keychain re-extraction.
+    // Schedules next check based on actual expiry time, retries quickly
+    // if refresh was a no-op. See: PR #32
+    if (config.refreshEnabled && config.credsPath !== 'env') {
+      const thresholdMin = (config.refreshThresholdMs / 60000).toFixed(0);
+      const retrySec = (config.refreshRetryMs / 1000).toFixed(0);
+      console.log(`  Token refresh:     when <${thresholdMin}m remaining (retry ${retrySec}s on no-op)`);
+      const computeNextDelay = () => {
+        try {
+          const oauth = getToken(config.credsPath);
+          const untilCheck = oauth.expiresAt - Date.now() - config.refreshThresholdMs;
+          return Math.max(untilCheck, 0);
+        } catch(e) {
+          return config.refreshRetryMs;
+        }
+      };
+      const scheduleNext = (delay) => setTimeout(() => {
+        const result = maybeRefreshCredentials(config);
+        scheduleNext(result === 'retry' ? config.refreshRetryMs : computeNextDelay());
+      }, delay).unref();
+      scheduleNext(computeNextDelay());
+    }
   });
 
   for (const sig of ['SIGINT', 'SIGTERM']) {
@@ -1543,6 +1635,11 @@ module.exports = {
   unmaskThinkingBlocks,
   hasThinkingEnabled,
   isThinkingSSEEvent,
+  refreshCredentials,
+  maybeRefreshCredentials,
+  DEFAULT_REFRESH_THRESHOLD_MINUTES,
+  DEFAULT_REFRESH_RETRY_SECONDS,
+  CLAUDE_CLI_REFRESH_TIMEOUT_MS,
   _usageData: () => usageData,
   _resetUsageData: () => { usageData = { version: 1, days: {} }; },
 };
