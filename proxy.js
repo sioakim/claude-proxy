@@ -43,7 +43,7 @@ const { StringDecoder } = require('string_decoder');
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.2.7';
+const VERSION = '2.3.0';
 const USAGE_FILE = path.join(__dirname, 'data', 'usage.json');
 
 // ─── Layer 8: Claude Code Identity & Billing ───────────────────────
@@ -68,11 +68,16 @@ function extractFirstUserMessageText(bodyStr) {
   return msgMatch ? msgMatch[1] : '';
 }
 
+function computeCch(text) {
+  return crypto.createHash('sha256').update(text || '').digest('hex').slice(0, 5);
+}
+
 function buildBillingBlock(firstUserMessage) {
   const fp = computeBillingFingerprint(firstUserMessage, CC_VERSION);
+  const cch = computeCch(firstUserMessage);
   return {
     type: 'text',
-    text: `x-anthropic-billing-header: cc_version=${CC_VERSION}.${fp}; cc_entrypoint=cli; cch=00000;`
+    text: `x-anthropic-billing-header: cc_version=${CC_VERSION}.${fp}; cc_entrypoint=cli; cch=${cch};`
   };
 }
 
@@ -99,26 +104,44 @@ function buildUserAgent() {
 
 
 // Beta flags required for OAuth + Claude Code features
+// Fake betas removed: advanced-tool-use-2025-11-20, fast-mode-2026-02-01 (don't exist in Claude Code)
 const REQUIRED_BETAS = [
   'claude-code-20250219',
   'oauth-2025-04-20',
   'interleaved-thinking-2025-05-14',
   'context-management-2025-06-27',
-  'prompt-caching-scope-2026-01-05',
-  'effort-2025-11-24',
-  'advanced-tool-use-2025-11-20',
-  'fast-mode-2026-02-01'
+  'prompt-caching-scope-2026-01-05'
 ];
+
+// Model-aware beta selection:
+// - Haiku cannot handle interleaved-thinking (returns 400)
+// - effort-2025-11-24 only applies to 4.6 models (Sonnet/Opus 4-6)
+function getModelBetas(modelId) {
+  const m = (modelId || '').toLowerCase();
+  const betas = [...REQUIRED_BETAS];
+  // Haiku rejects interleaved-thinking with 400
+  if (m.includes('haiku')) {
+    const idx = betas.indexOf('interleaved-thinking-2025-05-14');
+    if (idx !== -1) betas.splice(idx, 1);
+  }
+  // effort beta only for 4.6 models
+  if (m.includes('4-6') || m.includes('4_6')) {
+    if (!betas.includes('effort-2025-11-24')) betas.push('effort-2025-11-24');
+  }
+  return betas;
+}
 
 // ─── CC Tool Stubs ──────────────────────────────────────────────────────────
 // Injected into tools array to make the tool set look more like a Claude Code
 // session. The model won't call these (schemas are minimal).
+// CC tool stubs disabled by default — bare PascalCase names without mcp_ prefix cause
+// 'tool not found' loops (upstream issue #43). Only enable for detection testing.
 const CC_TOOL_STUBS = [
-  '{"name":"Glob","description":"Find files by pattern","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern"}},"required":["pattern"]}}',
-  '{"name":"Grep","description":"Search file contents","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Regex pattern"},"path":{"type":"string","description":"Search path"}},"required":["pattern"]}}',
-  '{"name":"Agent","description":"Launch a subagent for complex tasks","input_schema":{"type":"object","properties":{"prompt":{"type":"string","description":"Task description"}},"required":["prompt"]}}',
-  '{"name":"NotebookEdit","description":"Edit notebook cells","input_schema":{"type":"object","properties":{"notebook_path":{"type":"string"},"cell_index":{"type":"integer"}},"required":["notebook_path"]}}',
-  '{"name":"TodoRead","description":"Read current task list","input_schema":{"type":"object","properties":{}}}'
+  '{"name":"mcp_Glob","description":"Find files by pattern","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern"}},"required":["pattern"]}}',
+  '{"name":"mcp_Grep","description":"Search file contents","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Regex pattern"},"path":{"type":"string","description":"Search path"}},"required":["pattern"]}}',
+  '{"name":"mcp_Agent","description":"Launch a subagent for complex tasks","input_schema":{"type":"object","properties":{"prompt":{"type":"string","description":"Task description"}},"required":["prompt"]}}',
+  '{"name":"mcp_NotebookEdit","description":"Edit notebook cells","input_schema":{"type":"object","properties":{"notebook_path":{"type":"string"},"cell_index":{"type":"integer"}},"required":["notebook_path"]}}',
+  '{"name":"mcp_TodoRead","description":"Read current task list","input_schema":{"type":"object","properties":{}}}'
 ];
 
 // ─── Layer 3: Tool Name Renames ─────────────────────────────────────────────
@@ -126,45 +149,47 @@ const CC_TOOL_STUBS = [
 // This defeats Anthropic's tool-name fingerprinting which identifies the request
 // as OpenClaw based on the combination of tool names in the tools array.
 // ORDERING: lcm_expand_query MUST come before lcm_expand to avoid partial match.
+// Tool renames use mcp_ prefix — Anthropic's billing validator rejects bare PascalCase names
+// NOTE: 'image' → 'mcp_ImageGen' removed — collides with Anthropic content block type "image"
+// (image content blocks would have their type renamed, causing 400 errors — upstream issue #14)
 const DEFAULT_TOOL_RENAMES = [
-  ['exec', 'Bash'],
-  ['process', 'BashSession'],
-  ['browser', 'BrowserControl'],
-  ['canvas', 'CanvasView'],
-  ['nodes', 'DeviceControl'],
-  ['cron', 'Scheduler'],
-  ['message', 'SendMessage'],
-  ['tts', 'Speech'],
-  ['gateway', 'SystemCtl'],
-  ['agents_list', 'AgentList'],
-  ['sessions_list', 'TaskList'],
-  ['sessions_history', 'TaskHistory'],
-  ['sessions_send', 'TaskSend'],
-  ['sessions_spawn', 'TaskCreate'],
-  ['subagents', 'AgentControl'],
-  ['session_status', 'StatusCheck'],
-  ['read', 'Read'],
-  ['write', 'Write'],
-  ['edit', 'Edit'],
-  ['grep', 'Grep'],
-  ['glob', 'Glob'],
-  ['ls', 'LS'],
-  ['web_search', 'WebSearch'],
-  ['web_fetch', 'WebFetch'],
-  ['image', 'ImageGen'],
-  ['pdf', 'PdfParse'],
-  ['memory_search', 'KnowledgeSearch'],
-  ['memory_get', 'KnowledgeGet'],
-  ['lcm_expand_query', 'ContextQuery'],
-  ['lcm_grep', 'ContextGrep'],
-  ['lcm_describe', 'ContextDescribe'],
-  ['lcm_expand', 'ContextExpand'],
-  ['sessions_yield', 'TaskYield'],
-  ['sessions_store', 'TaskStore'],
-  ['sessions_yield_interrupt', 'TaskYieldInterrupt'],
-  ['image_generate', 'ImageCreate'],
-  ['music_generate', 'MusicCreate'],
-  ['video_generate', 'VideoCreate']
+  ['exec', 'mcp_Bash'],
+  ['process', 'mcp_BashSession'],
+  ['browser', 'mcp_BrowserControl'],
+  ['canvas', 'mcp_CanvasView'],
+  ['nodes', 'mcp_DeviceControl'],
+  ['cron', 'mcp_Scheduler'],
+  ['message', 'mcp_SendMessage'],
+  ['tts', 'mcp_Speech'],
+  ['gateway', 'mcp_SystemCtl'],
+  ['agents_list', 'mcp_AgentList'],
+  ['sessions_list', 'mcp_TaskList'],
+  ['sessions_history', 'mcp_TaskHistory'],
+  ['sessions_send', 'mcp_TaskSend'],
+  ['sessions_spawn', 'mcp_TaskCreate'],
+  ['subagents', 'mcp_AgentControl'],
+  ['session_status', 'mcp_StatusCheck'],
+  ['read', 'mcp_Read'],
+  ['write', 'mcp_Write'],
+  ['edit', 'mcp_Edit'],
+  ['grep', 'mcp_Grep'],
+  ['glob', 'mcp_Glob'],
+  ['ls', 'mcp_LS'],
+  ['web_search', 'mcp_WebSearch'],
+  ['web_fetch', 'mcp_WebFetch'],
+  ['pdf', 'mcp_PdfParse'],
+  ['memory_search', 'mcp_KnowledgeSearch'],
+  ['memory_get', 'mcp_KnowledgeGet'],
+  ['lcm_expand_query', 'mcp_ContextQuery'],
+  ['lcm_grep', 'mcp_ContextGrep'],
+  ['lcm_describe', 'mcp_ContextDescribe'],
+  ['lcm_expand', 'mcp_ContextExpand'],
+  ['sessions_yield', 'mcp_TaskYield'],
+  ['sessions_store', 'mcp_TaskStore'],
+  ['sessions_yield_interrupt', 'mcp_TaskYieldInterrupt'],
+  ['image_generate', 'mcp_ImageCreate'],
+  ['music_generate', 'mcp_MusicCreate'],
+  ['video_generate', 'mcp_VideoCreate']
 ];
 
 // ─── Layer 6: Property Name Renames ─────────────────────────────────────────
@@ -322,7 +347,8 @@ function loadConfig() {
     propRenames: mergeArrayPairs(DEFAULT_PROP_RENAMES, config.propRenames),
     stripSystemConfig: config.stripSystemConfig !== false,
     stripToolDescriptions: config.stripToolDescriptions !== false,
-    injectCCStubs: config.injectCCStubs !== false,
+    // CC tool stubs disabled by default — causes 'tool not found' loops (upstream issue #43)
+    injectCCStubs: config.injectCCStubs === true,
     stripTrailingAssistantPrefill: config.stripTrailingAssistantPrefill !== false,
     refreshEnabled: config.refreshEnabled !== false,
     refreshThresholdMs: (config.refreshThresholdMinutes || DEFAULT_REFRESH_THRESHOLD_MINUTES) * 60 * 1000,
@@ -559,11 +585,79 @@ function isThinkingSSEEvent(eventStr) {
   return false;
 }
 
+// ─── Tool Pair Repair ───────────────────────────────────────────────────────
+// Removes orphaned tool_use/tool_result blocks that would cause API 400 errors.
+// Must run before any transforms since it needs valid JSON to parse.
+function repairToolPairs(bodyStr) {
+  const msgArrayMatch = /"messages"\s*:\s*(\[)/.exec(bodyStr);
+  if (!msgArrayMatch) return bodyStr;
+  const arrayOpenIdx = msgArrayMatch.index + msgArrayMatch[0].length - 1;
+  const arrayCloseIdx = findMatchingBracket(bodyStr, arrayOpenIdx);
+  if (arrayCloseIdx === -1) return bodyStr;
+
+  let messages;
+  try {
+    messages = JSON.parse(bodyStr.slice(arrayOpenIdx, arrayCloseIdx + 1));
+  } catch (e) {
+    return bodyStr; // if parse fails, leave untouched
+  }
+  if (!Array.isArray(messages)) return bodyStr;
+
+  const toolUseIds = new Set();
+  const toolResultIds = new Set();
+  for (const message of messages) {
+    if (!Array.isArray(message.content)) continue;
+    for (const block of message.content) {
+      if (block.type === 'tool_use' && typeof block.id === 'string') toolUseIds.add(block.id);
+      if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') toolResultIds.add(block.tool_use_id);
+    }
+  }
+
+  const orphanedUses = new Set([...toolUseIds].filter(id => !toolResultIds.has(id)));
+  const orphanedResults = new Set([...toolResultIds].filter(id => !toolUseIds.has(id)));
+  if (orphanedUses.size === 0 && orphanedResults.size === 0) return bodyStr;
+
+  console.log(`[REPAIR] Removing ${orphanedUses.size} orphaned tool_use and ${orphanedResults.size} orphaned tool_result blocks`);
+
+  const candidateRepaired = messages.map((message) => {
+    if (!Array.isArray(message.content)) return message;
+    const filtered = message.content.filter((block) => {
+      if (block.type === 'tool_use' && typeof block.id === 'string') return !orphanedUses.has(block.id);
+      if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') return !orphanedResults.has(block.tool_use_id);
+      return true;
+    });
+    if (filtered.length === 0) return null;
+    return { ...message, content: filtered };
+  });
+
+  const repaired = [];
+  for (let i = 0; i < candidateRepaired.length; i++) {
+    if (candidateRepaired[i] !== null) {
+      repaired.push(candidateRepaired[i]);
+    } else {
+      const prevRole = repaired.length > 0 ? repaired[repaired.length - 1].role : null;
+      const nextMsg = candidateRepaired.slice(i + 1).find(m => m !== null);
+      const nextRole = nextMsg ? nextMsg.role : null;
+      if (prevRole && nextRole && prevRole === nextRole) {
+        repaired.push({ ...messages[i], content: [{ type: 'text', text: '(removed)' }] });
+      }
+    }
+  }
+
+  return bodyStr.slice(0, arrayOpenIdx) + JSON.stringify(repaired) + bodyStr.slice(arrayCloseIdx + 1);
+}
+
 // ─── Request Processing ─────────────────────────────────────────────────────
 // BILLING_OBJ removed — now uses dynamic buildBillingBlock()
 const CACHE_1H = { type: 'ephemeral', ttl: '1h' };
 
 function processBody(bodyStr, config) {
+  // Repair orphaned tool_use/tool_result pairs before any transforms
+  bodyStr = repairToolPairs(bodyStr);
+
+  // Extract original first user text for CCH computation BEFORE any transforms
+  const originalFirstUserText = extractFirstUserMessageText(bodyStr);
+
   // Thinking block preservation: mask thinking blocks before any transforms
   const thinkingActive = hasThinkingEnabled(bodyStr);
   let thinkingStore = [];
@@ -709,8 +803,8 @@ function processBody(bodyStr, config) {
     const parsed = JSON.parse(modified);
 
     // Layer 8: Dynamic billing block + Claude Code identity
-    const firstUserMsg = extractFirstUserMessageText(modified);
-    const billingObj = buildBillingBlock(firstUserMsg);
+    // Use pre-transform text so CCH hash is computed from original content
+    const billingObj = buildBillingBlock(originalFirstUserText);
     const identityObj = { type: 'text', text: CLAUDE_CODE_IDENTITY_STRING, cache_control: CACHE_1H };
 
     // Inject billing + identity into system prompt
@@ -1322,6 +1416,9 @@ function startServer(config) {
 
       // Process body: sanitize triggers + inject billing header
       let bodyStr = body.toString('utf8');
+      // Extract model before processBody transforms it (for beta selection)
+      const betaModelMatch = bodyStr.match(/"model"\s*:\s*"([^"]+)"/);
+      const requestModel = betaModelMatch ? betaModelMatch[1] : '';
       bodyStr = processBody(bodyStr, config);
       body = Buffer.from(bodyStr, 'utf8');
 
@@ -1342,10 +1439,11 @@ function startServer(config) {
       // Anthropic API version (required, matches real CC)
       headers['anthropic-version'] = '2023-06-01';
 
-      // Merge required betas
+      // Merge required betas — model-aware (Haiku/non-4.6 get filtered set)
+      const modelBetas = getModelBetas(requestModel);
       const existingBeta = headers['anthropic-beta'] || '';
       const betas = existingBeta ? existingBeta.split(',').map(b => b.trim()) : [];
-      for (const b of REQUIRED_BETAS) {
+      for (const b of modelBetas) {
         if (!betas.includes(b)) betas.push(b);
       }
       headers['anthropic-beta'] = betas.join(',');
@@ -1357,7 +1455,7 @@ function startServer(config) {
       headers['x-stainless-arch'] = getStainlessArch();
       headers['x-stainless-lang'] = 'js';
       headers['x-stainless-os'] = getStainlessOs();
-      headers['x-stainless-package-version'] = '0.81.0';
+      headers['x-stainless-package-version'] = '0.90.0';
       headers['x-stainless-runtime'] = 'node';
       headers['x-stainless-runtime-version'] = process.version;
       headers['x-stainless-retry-count'] = '0';
