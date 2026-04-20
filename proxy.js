@@ -43,7 +43,7 @@ const { StringDecoder } = require('string_decoder');
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.4.0';
+const VERSION = '2.4.1';
 const USAGE_FILE = path.join(__dirname, 'data', 'usage.json');
 
 // ─── Layer 8: Claude Code Identity & Billing ───────────────────────
@@ -193,6 +193,16 @@ function sanitizeMessageOrchestration(bodyStr) {
               if (cleaned !== block.text) { block.text = cleaned; changed = true; }
             }
           }
+          // Drop text blocks that became empty after orchestration-tag scrubbing.
+          // CC v2.1.112 splits per-reminder system-reminders into separate content
+          // blocks; scrubbing leaves each as {type:'text',text:''} which Anthropic
+          // rejects with "text content blocks must be non-empty" (upstream #54).
+          // Non-text blocks (tool_result, tool_use, image) pass through intact.
+          const beforeLen = msg.content.length;
+          msg.content = msg.content.filter(b =>
+            !(b && b.type === 'text' && b.text === '')
+          );
+          if (msg.content.length !== beforeLen) changed = true;
         }
       }
       if (changed) {
