@@ -43,7 +43,7 @@ const { StringDecoder } = require('string_decoder');
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.4.1';
+const VERSION = '2.4.2';
 const USAGE_FILE = path.join(__dirname, 'data', 'usage.json');
 
 // ─── Layer 8: Claude Code Identity & Billing ───────────────────────
@@ -124,7 +124,7 @@ function buildBillingBlock(firstUserMessage) {
   const cch = computeCch();
   return {
     type: 'text',
-    text: `x-anthropic-billing-header: cc_version=${CC_VERSION}.${fp}; cc_entrypoint=cli; cch=${cch};`
+    text: `x-anthropic-billing-header: cc_version=${CC_VERSION}.${fp}; cc_entrypoint=sdk-cli; cch=${cch};`
   };
 }
 
@@ -851,7 +851,8 @@ function repairToolPairs(bodyStr) {
 
 // ─── Request Processing ─────────────────────────────────────────────────────
 // BILLING_OBJ removed — now uses dynamic buildBillingBlock()
-const CACHE_1H = { type: 'ephemeral', ttl: '1h' };
+// [dario v3.30.1] CC v2.1.114 MITM: cache_control drops ttl:'1h' → bare {type:'ephemeral'}
+const CACHE_1H = { type: 'ephemeral' };
 
 function processBody(bodyStr, config) {
   // Repair orphaned tool_use/tool_result pairs before any transforms
