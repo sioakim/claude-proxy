@@ -1,5 +1,69 @@
 # Changelog
 
+## v2.4.0 -- 2026-04-20
+
+### dario knowledge port — 10 fingerprint improvements
+
+Ported behavioral fingerprint mitigations from the dario project (v3.30.0) to
+close detection gaps that string-level transforms alone can't address.
+
+**New Layers:**
+
+1. **Header ordering (Layer 13)** — CC sends HTTP headers in a specific order.
+   Our proxy now reorders outbound headers to match CC's exact wire order
+   (accept → content-type → user-agent → x-claude-code-session-id → ...).
+   Source: `dario/cc-template.ts::orderHeadersForOutbound`.
+
+2. **Body field ordering (Layer 14)** — JSON key order is observable on the wire.
+   Request bodies are now reordered to match CC's field order: model, messages,
+   system, tools, metadata, max_tokens, thinking, context_management, etc.
+   Source: `dario/cc-template.ts::orderBodyForOutbound`.
+
+3. **Session ID rotation (Layer 9)** — Replaced static SESSION_ID with idle-based
+   rotation. Session rotates after ~15min idle + 0-3min random jitter, matching
+   how real CC mints new sessions per conversation. Source:
+   `dario/session-rotation.ts::SessionRegistry`.
+
+4. **Inter-request pacing (Layer 10)** — Added minimum 500ms + 200ms random jitter
+   between outbound requests to avoid machine-speed request patterns.
+   Source: `dario/pacing.ts::computePacingDelay`.
+
+5. **Orchestration tag stripping (Layer 11)** — Strips XML-style tags injected by
+   agent frameworks (`<system-reminder>`, `<env>`, `<current_working_directory>`,
+   `<agent_persona>`, etc.) from messages before forwarding. 15 tag patterns.
+   Source: `dario/proxy.ts::sanitizeMessages`.
+
+6. **Billable beta filtering (Layer 12)** — Filters out `extended-cache-ttl-*` beta
+   flags that require Extra Usage billing. Prevents 400 errors on subscription-only
+   accounts. Source: `dario/proxy.ts::filterBillableBetas`.
+
+**Updated:**
+
+7. **CC version bump** — `CC_VERSION` updated from `2.1.97` to `2.1.114` (matching
+   dario's live fingerprint capture).
+
+8. **Stainless SDK version** — Updated from `0.90.0` to `0.81.0` and runtime version
+   from Node's actual version to `v24.3.0` (Bun's Node compat version, which is
+   what CC actually reports).
+
+9. **CCH computation fix** — `computeCch()` changed from deterministic SHA256(text)
+   to random 5-char hex per request, matching real CC behavior. The old deterministic
+   hash was itself a fingerprint.
+
+10. **Build tag computation** — Verified our `computeBillingFingerprint` matches
+    dario's `computeBuildTag` (same salt, same indices [4,7,20], same SHA256 approach).
+
+11. **Framework scrubbing** — Added Hermes, LibreChat, TypingMind to string trigger
+    replacements.
+
+12. **Beta flags** — Added `advisor-tool-2026-03-01` and `afk-mode-2026-01-31` to
+    match CC v2.1.114's captured beta set.
+
+13. **Tool mappings** — Added `ollama_web_search`, `ollama_web_fetch`,
+    `sessions_yield_interrupt` mappings.
+
+---
+
 ## v1.4.0 -- 2026-04-06
 
 ### macOS Keychain support

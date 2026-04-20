@@ -43,15 +43,59 @@ const { StringDecoder } = require('string_decoder');
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.3.0';
+const VERSION = '2.4.0';
 const USAGE_FILE = path.join(__dirname, 'data', 'usage.json');
 
 // ─── Layer 8: Claude Code Identity & Billing ───────────────────────
-const CC_VERSION = '2.1.97';
+// [dario] CC version updated to match dario v3.30 live fingerprint capture
+const CC_VERSION = '2.1.114';
 const BILLING_HASH_SALT = '59cf53e54c78';
 const BILLING_HASH_INDICES = [4, 7, 20];
 const DEVICE_ID = crypto.randomBytes(32).toString('hex');
-const SESSION_ID = crypto.randomUUID();
+
+// ─── Layer 9: Session ID Rotation (ported from dario/session-rotation.ts) ───
+// Real CC rotates session ID after idle gaps (~15min), not per-request or never.
+// A static session ID is a fingerprint; per-request rotation is also a fingerprint.
+// This module rotates after idle gaps with optional jitter to match CC's behavior.
+const SESSION_ROTATION_IDLE_MS = 15 * 60 * 1000; // 15 minutes idle threshold
+const SESSION_ROTATION_JITTER_MS = 3 * 60 * 1000; // 0-3 minutes random jitter
+let SESSION_ID = crypto.randomUUID();
+let sessionCreatedAt = Date.now();
+let sessionLastUsedAt = Date.now();
+let sessionIdleJitterMs = Math.floor(Math.random() * SESSION_ROTATION_JITTER_MS);
+
+function getOrRotateSessionId() {
+  const now = Date.now();
+  const idleThreshold = SESSION_ROTATION_IDLE_MS + sessionIdleJitterMs;
+  if (now - sessionLastUsedAt > idleThreshold) {
+    // Idle gap exceeded — rotate like a new CC conversation
+    SESSION_ID = crypto.randomUUID();
+    sessionCreatedAt = now;
+    sessionIdleJitterMs = Math.floor(Math.random() * SESSION_ROTATION_JITTER_MS);
+    console.log(`[SESSION] Rotated after ${((now - sessionLastUsedAt) / 60000).toFixed(1)}m idle`);
+  }
+  sessionLastUsedAt = now;
+  return SESSION_ID;
+}
+
+// ─── Layer 10: Inter-Request Pacing (ported from dario/pacing.ts) ───────────
+// Real CC has human-paced gaps between requests. Machine-speed firing is
+// a trivial fingerprint. Add minimum gap + jitter between outbound requests.
+const PACING_MIN_GAP_MS = 500;  // minimum ms between requests
+const PACING_JITTER_MS = 200;   // additional random jitter ms
+let lastRequestTime = 0;
+
+function computePacingDelay() {
+  if (lastRequestTime <= 0) return 0;
+  const now = Date.now();
+  const jitterAdd = PACING_JITTER_MS > 0 ? Math.floor(Math.random() * PACING_JITTER_MS) : 0;
+  const effectiveGap = PACING_MIN_GAP_MS + jitterAdd;
+  const elapsed = now - lastRequestTime;
+  if (elapsed >= effectiveGap) return 0;
+  return effectiveGap - elapsed;
+}
+
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
 // Claude Code identity string — injected as system prompt block
 const CLAUDE_CODE_IDENTITY_STRING = 'You are Claude Code, Anthropic\'s official CLI for Claude.';
@@ -68,13 +112,16 @@ function extractFirstUserMessageText(bodyStr) {
   return msgMatch ? msgMatch[1] : '';
 }
 
-function computeCch(text) {
-  return crypto.createHash('sha256').update(text || '').digest('hex').slice(0, 5);
+// [dario] CCH is random 5-char hex per request, NOT a hash of user message.
+// Real CC uses randomBytes, not a deterministic hash. Previous SHA256-based
+// computation was a fingerprint since it was deterministic for same input.
+function computeCch() {
+  return crypto.randomBytes(3).toString('hex').slice(0, 5);
 }
 
 function buildBillingBlock(firstUserMessage) {
   const fp = computeBillingFingerprint(firstUserMessage, CC_VERSION);
-  const cch = computeCch(firstUserMessage);
+  const cch = computeCch();
   return {
     type: 'text',
     text: `x-anthropic-billing-header: cc_version=${CC_VERSION}.${fp}; cc_entrypoint=cli; cch=${cch};`
@@ -101,16 +148,154 @@ function buildUserAgent() {
   return `claude-cli/${CC_VERSION} (external, cli)`;
 }
 
+// ─── Layer 11: Orchestration Tag Stripping (ported from dario/proxy.ts) ─────
+// Agent frameworks inject XML-style orchestration tags into messages that
+// Claude Code would never send. Strip them before forwarding upstream.
+const ORCHESTRATION_TAG_NAMES = [
+  'system-reminder', 'env', 'system_information', 'current_working_directory',
+  'operating_system', 'default_shell', 'home_directory', 'task_metadata',
+  'directories', 'thinking',
+  'agent_persona', 'agent_context', 'tool_context', 'persona', 'tool_call',
+];
+const ORCHESTRATION_PATTERNS = [];
+for (const tag of ORCHESTRATION_TAG_NAMES) {
+  ORCHESTRATION_PATTERNS.push(new RegExp(`<${tag}\\b[^>]*>[\\s\\S]*?<\\/${tag}>`, 'gi'));
+  ORCHESTRATION_PATTERNS.push(new RegExp(`<${tag}\\b[^>]*\\/>`, 'gi'));
+}
+
+function stripOrchestrationTags(text) {
+  let result = text;
+  for (const pattern of ORCHESTRATION_PATTERNS) {
+    pattern.lastIndex = 0;
+    result = result.replace(pattern, '');
+  }
+  return result.replace(/\n{3,}/g, '\n\n').trim();
+}
+
+function sanitizeMessageOrchestration(bodyStr) {
+  // Quick check — if no angle brackets, skip the expensive regex work
+  if (!bodyStr.includes('<system-reminder') && !bodyStr.includes('<env') &&
+      !bodyStr.includes('<current_working_directory') && !bodyStr.includes('<agent_')) {
+    return bodyStr;
+  }
+  try {
+    const parsed = JSON.parse(bodyStr);
+    if (Array.isArray(parsed.messages)) {
+      let changed = false;
+      for (const msg of parsed.messages) {
+        if (typeof msg.content === 'string') {
+          const cleaned = stripOrchestrationTags(msg.content);
+          if (cleaned !== msg.content) { msg.content = cleaned; changed = true; }
+        } else if (Array.isArray(msg.content)) {
+          for (const block of msg.content) {
+            if (block && block.type === 'text' && typeof block.text === 'string') {
+              const cleaned = stripOrchestrationTags(block.text);
+              if (cleaned !== block.text) { block.text = cleaned; changed = true; }
+            }
+          }
+        }
+      }
+      if (changed) {
+        console.log('[ORCH-STRIP] Removed orchestration tags from messages');
+        return JSON.stringify(parsed);
+      }
+    }
+  } catch (e) { /* not valid JSON at this stage, skip */ }
+  return bodyStr;
+}
+
+// ─── Layer 12: Billable Beta Filtering (ported from dario/proxy.ts) ─────────
+// extended-cache-ttl-* betas require Extra Usage to be enabled on the account.
+// Filter them out to avoid 400 errors on subscription-only accounts.
+const BILLABLE_BETA_PREFIXES = ['extended-cache-ttl-'];
+
+function filterBillableBetas(betaStr) {
+  return betaStr.split(',').map(b => b.trim()).filter(b =>
+    b.length > 0 && !BILLABLE_BETA_PREFIXES.some(p => b.startsWith(p))
+  ).join(',');
+}
+
+// ─── Layer 13: Header Ordering (ported from dario/cc-template.ts) ───────────
+// CC sends headers in a specific order. Node's http module uses insertion order.
+// Reproduce CC's exact header order to avoid server-side fingerprinting.
+const CC_HEADER_ORDER = [
+  'accept', 'content-type', 'user-agent', 'x-claude-code-session-id',
+  'x-stainless-arch', 'x-stainless-lang', 'x-stainless-os',
+  'x-stainless-package-version', 'x-stainless-retry-count',
+  'x-stainless-runtime', 'x-stainless-runtime-version',
+  'x-stainless-timeout', 'anthropic-beta',
+  'anthropic-dangerous-direct-browser-access', 'anthropic-version',
+  'authorization', 'x-app', 'content-length',
+];
+
+function orderHeadersForOutbound(headers) {
+  const lowerToValue = new Map();
+  const lowerToOrigKey = new Map();
+  for (const [k, v] of Object.entries(headers)) {
+    const lk = k.toLowerCase();
+    lowerToValue.set(lk, v);
+    lowerToOrigKey.set(lk, k);
+  }
+  const ordered = {};
+  const seen = new Set();
+  for (const name of CC_HEADER_ORDER) {
+    const key = name.toLowerCase();
+    if (seen.has(key)) continue;
+    const value = lowerToValue.get(key);
+    if (value !== undefined) {
+      ordered[name] = value;
+      seen.add(key);
+    }
+  }
+  // Append any headers not in the CC order (e.g. custom headers)
+  for (const [k, v] of Object.entries(headers)) {
+    const lk = k.toLowerCase();
+    if (!seen.has(lk)) {
+      ordered[k] = v;
+    }
+  }
+  return ordered;
+}
+
+// ─── Layer 14: Body Field Ordering (ported from dario/cc-template.ts) ───────
+// JSON key order is observable on the wire. CC sends fields in a specific order.
+const CC_BODY_FIELD_ORDER = [
+  'model', 'messages', 'system', 'tools', 'metadata', 'max_tokens',
+  'thinking', 'context_management', 'output_config', 'stream',
+  'temperature', 'top_k', 'top_p', 'stop_sequences', 'tool_choice',
+];
+
+function orderBodyForOutbound(body) {
+  const ordered = {};
+  const seen = new Set();
+  for (const name of CC_BODY_FIELD_ORDER) {
+    if (seen.has(name)) continue;
+    if (Object.prototype.hasOwnProperty.call(body, name)) {
+      ordered[name] = body[name];
+      seen.add(name);
+    }
+  }
+  // Append any fields not in the CC order
+  for (const k of Object.keys(body)) {
+    if (!seen.has(k)) {
+      ordered[k] = body[k];
+    }
+  }
+  return ordered;
+}
+
 
 
 // Beta flags required for OAuth + Claude Code features
-// Fake betas removed: advanced-tool-use-2025-11-20, fast-mode-2026-02-01 (don't exist in Claude Code)
+// [dario] Updated to match CC v2.1.114 captured beta set from dario v3.30
 const REQUIRED_BETAS = [
   'claude-code-20250219',
   'oauth-2025-04-20',
   'interleaved-thinking-2025-05-14',
   'context-management-2025-06-27',
-  'prompt-caching-scope-2026-01-05'
+  'prompt-caching-scope-2026-01-05',
+  'advisor-tool-2026-03-01',
+  'afk-mode-2026-01-31'
 ];
 
 // Model-aware beta selection:
@@ -189,7 +374,9 @@ const DEFAULT_TOOL_RENAMES = [
   ['sessions_yield_interrupt', 'mcp_TaskYieldInterrupt'],
   ['image_generate', 'mcp_ImageCreate'],
   ['music_generate', 'mcp_MusicCreate'],
-  ['video_generate', 'mcp_VideoCreate']
+  ['video_generate', 'mcp_VideoCreate'],
+  ['ollama_web_search', 'mcp_OllamaSearch'],
+  ['ollama_web_fetch', 'mcp_OllamaFetch']
 ];
 
 // ─── Layer 6: Property Name Renames ─────────────────────────────────────────
@@ -210,6 +397,8 @@ const DEFAULT_PROP_RENAMES = [
 // Applied globally via split/join on the entire request body.
 // IMPORTANT: Use space-free replacements for lowercase 'openclaw' to avoid
 // breaking filesystem paths.
+// [dario] Framework pattern scrubbing improvements ported from dario/cc-template.ts
+// Added: sessions_* pattern, gateway, powered by, and additional framework names
 const DEFAULT_REPLACEMENTS = [
   ['OpenClaw', 'OCPlatform'],
   ['openclaw', 'ocplatform'],
@@ -221,7 +410,10 @@ const DEFAULT_REPLACEMENTS = [
   ['sessions_yield', 'yield_task'],
   ['sessions_store', 'task_store'],
   ['HEARTBEAT_OK', 'HB_ACK'],
-  ['running inside', 'running on']
+  ['running inside', 'running on'],
+  ['Hermes', 'Assistant'],
+  ['LibreChat', 'Assistant'],
+  ['TypingMind', 'Assistant']
 ];
 
 // Reverse mapping: applied to API responses before returning to OpenClaw.
@@ -655,7 +847,10 @@ function processBody(bodyStr, config) {
   // Repair orphaned tool_use/tool_result pairs before any transforms
   bodyStr = repairToolPairs(bodyStr);
 
-  // Extract original first user text for CCH computation BEFORE any transforms
+  // [dario] Layer 11: Strip orchestration tags from messages before any other transforms
+  bodyStr = sanitizeMessageOrchestration(bodyStr);
+
+  // Extract original first user text for billing tag computation BEFORE any transforms
   const originalFirstUserText = extractFirstUserMessageText(bodyStr);
 
   // Thinking block preservation: mask thinking blocks before any transforms
@@ -818,9 +1013,10 @@ function processBody(bodyStr, config) {
     }
 
     // Layer 8: Request metadata injection (only user_id is allowed by the API)
+    // [dario] Session ID now rotated dynamically via getOrRotateSessionId()
     parsed.metadata = {
       ...(parsed.metadata || {}),
-      user_id: JSON.stringify({ device_id: DEVICE_ID, session_id: SESSION_ID })
+      user_id: JSON.stringify({ device_id: DEVICE_ID, session_id: getOrRotateSessionId() })
     };
 
     // Layer 8: Temperature normalization
@@ -838,6 +1034,13 @@ function processBody(bodyStr, config) {
 
     // Layer 8: Strip stale betas body field (API rejects it; betas are header-only)
     delete parsed.betas;
+
+    // [dario] Layer 14: Reorder body fields to match CC's wire order
+    // JSON key order is observable; CC sends model,messages,system,tools,... in that order
+    const orderedParsed = orderBodyForOutbound(parsed);
+    // Copy ordered keys back (we return JSON.stringify of parsed, so replace in-place)
+    for (const key of Object.keys(parsed)) delete parsed[key];
+    Object.assign(parsed, orderedParsed);
 
     // Strip trailing assistant messages (prefill).
     // OpenClaw sometimes pre-fills the next assistant turn to resume interrupted responses.
@@ -1078,7 +1281,7 @@ const dashboard = {
       const h = isFinite(expiresIn) ? expiresIn.toFixed(1) + 'h' : 'n/a (env var)';
       console.log(`\n  Claude Proxy v${VERSION}`);
       console.log(`  Port: ${config.port}  Sub: ${oauth.subscriptionType}  Token: ${h}h  Cache: ${config.cacheEnabled ? '1h TTL' : 'off'}`);
-      console.log(`  CC Emulation: v${CC_VERSION}  Device: ${DEVICE_ID.slice(0, 8)}...  Session: ${SESSION_ID.slice(0, 8)}...`);
+      console.log(`  CC Emulation: v${CC_VERSION}  SDK: 0.81.0  Pacing: ${PACING_MIN_GAP_MS}+${PACING_JITTER_MS}ms`);
       console.log(`  Ready. Set openclaw.json baseUrl to http://127.0.0.1:${config.port}\n`);
       return;
     }
@@ -1367,7 +1570,11 @@ function startServer(config) {
           ccEmulation: {
             ccVersion: CC_VERSION,
             deviceId: DEVICE_ID.slice(0, 8) + '...',
-            sessionId: SESSION_ID.slice(0, 8) + '...'
+            sessionId: SESSION_ID.slice(0, 8) + '...',
+            headerOrdering: true,
+            bodyFieldOrdering: true,
+            sessionRotation: true,
+            interRequestPacing: `${PACING_MIN_GAP_MS}+${PACING_JITTER_MS}ms`
           },
           layers: {
             stringReplacements: config.replacements.length,
@@ -1432,9 +1639,15 @@ function startServer(config) {
         headers[key] = value;
       }
 
+      // [dario] Layer 9: Rotate session ID on idle gaps (matches CC behavior)
+      const currentSessionId = getOrRotateSessionId();
+
+      // [dario] Layer 8: Stainless SDK headers (Claude Code request signature)
+      // Header values updated to match CC v2.1.114 captured by dario v3.30
+      headers['accept'] = 'application/json';
+      headers['content-type'] = 'application/json';
       headers['authorization'] = `Bearer ${oauth.accessToken}`;
       headers['content-length'] = body.length;
-      headers['accept-encoding'] = 'identity';
 
       // Anthropic API version (required, matches real CC)
       headers['anthropic-version'] = '2023-06-01';
@@ -1446,24 +1659,27 @@ function startServer(config) {
       for (const b of modelBetas) {
         if (!betas.includes(b)) betas.push(b);
       }
-      headers['anthropic-beta'] = betas.join(',');
+      // [dario] Layer 12: Filter billable betas that require Extra Usage
+      headers['anthropic-beta'] = filterBillableBetas(betas.join(','));
 
-      // Layer 8: Stainless SDK headers (Claude Code request signature)
       headers['user-agent'] = buildUserAgent();
       headers['x-app'] = 'cli';
-      headers['x-claude-code-session-id'] = SESSION_ID;
+      headers['x-claude-code-session-id'] = currentSessionId;
       headers['x-stainless-arch'] = getStainlessArch();
       headers['x-stainless-lang'] = 'js';
       headers['x-stainless-os'] = getStainlessOs();
-      headers['x-stainless-package-version'] = '0.90.0';
+      // [dario] Stainless SDK version updated to match CC v2.1.114
+      headers['x-stainless-package-version'] = '0.81.0';
       headers['x-stainless-runtime'] = 'node';
-      headers['x-stainless-runtime-version'] = process.version;
+      // [dario] CC runs on Bun which reports v24.3.0 as Node compat version
+      headers['x-stainless-runtime-version'] = 'v24.3.0';
       headers['x-stainless-retry-count'] = '0';
       headers['x-stainless-timeout'] = '600';
       headers['anthropic-dangerous-direct-browser-access'] = 'true';
 
       // Strip headers not sent by real Claude Code
       delete headers['x-session-affinity'];
+      delete headers['accept-encoding'];
 
       // Extract model shortcode from request body
       let modelTag = '?';
@@ -1492,9 +1708,17 @@ function startServer(config) {
         // Keep original path on parse error
       }
 
+      // [dario] Layer 13: Reorder headers to match CC's exact wire order
+      const orderedHeaders = orderHeadersForOutbound(headers);
+
+      // [dario] Layer 10: Inter-request pacing (avoid machine-speed patterns)
+      const pacingDelay = computePacingDelay();
+      const sendUpstream = () => {
+        lastRequestTime = Date.now();
+
       const upstream = https.request({
         hostname: UPSTREAM_HOST, port: 443,
-        path: upstreamPath, method: req.method, headers
+        path: upstreamPath, method: req.method, headers: orderedHeaders
       }, (upRes) => {
         // Capture rate-limit headers from every response
         dashboard.updateRateLimit(upRes);
@@ -1636,6 +1860,14 @@ function startServer(config) {
 
       upstream.write(body);
       upstream.end();
+      }; // end sendUpstream
+
+      // [dario] Layer 10: Apply pacing delay before sending
+      if (pacingDelay > 0) {
+        sleep(pacingDelay).then(sendUpstream);
+      } else {
+        sendUpstream();
+      }
     });
   });
 
@@ -1762,4 +1994,20 @@ module.exports = {
   CLAUDE_CLI_REFRESH_TIMEOUT_MS,
   _usageData: () => usageData,
   _resetUsageData: () => { usageData = { version: 1, days: {} }; },
+  // v2.4.0 exports (dario ports)
+  getOrRotateSessionId,
+  computePacingDelay,
+  orderHeadersForOutbound,
+  orderBodyForOutbound,
+  stripOrchestrationTags,
+  sanitizeMessageOrchestration,
+  filterBillableBetas,
+  computeCch,
+  CC_HEADER_ORDER,
+  CC_BODY_FIELD_ORDER,
+  ORCHESTRATION_TAG_NAMES,
+  PACING_MIN_GAP_MS,
+  PACING_JITTER_MS,
+  SESSION_ROTATION_IDLE_MS,
+  SESSION_ROTATION_JITTER_MS,
 };

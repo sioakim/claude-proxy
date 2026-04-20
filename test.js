@@ -451,8 +451,10 @@ describe('Feature: Response Reverse Mapping', () => {
 
 describe('Feature: Replacement / Reverse-Map Consistency', () => {
   it('should have a reverse-map entry for each replacement (except intentional one-way)', () => {
-    // The "running inside" -> "running on" replacement is intentionally one-way
-    const oneWay = new Set(['running inside']);
+    // These replacements are intentionally one-way (no reverse mapping needed):
+    // - "running inside" -> "running on": semantic normalization
+    // - Framework names -> "Assistant": multiple names map to same target, can't reverse
+    const oneWay = new Set(['running inside', 'Hermes', 'LibreChat', 'TypingMind']);
     for (const [find, replace] of DEFAULT_REPLACEMENTS) {
       if (oneWay.has(find)) continue;
       const hasReverse = DEFAULT_REVERSE_MAP.some(([sanitized]) => sanitized === replace);
@@ -461,7 +463,7 @@ describe('Feature: Replacement / Reverse-Map Consistency', () => {
   });
 
   it('should have matching pairs between replacement and reverse', () => {
-    const oneWay = new Set(['running inside']);
+    const oneWay = new Set(['running inside', 'Hermes', 'LibreChat', 'TypingMind']);
     for (const [find, replace] of DEFAULT_REPLACEMENTS) {
       if (oneWay.has(find)) continue;
       const reverseEntry = DEFAULT_REVERSE_MAP.find(([sanitized]) => sanitized === replace);
