@@ -43,12 +43,12 @@ const { StringDecoder } = require('string_decoder');
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.4.2';
+const VERSION = '2.4.3';
 const USAGE_FILE = path.join(__dirname, 'data', 'usage.json');
 
 // ─── Layer 8: Claude Code Identity & Billing ───────────────────────
-// [dario] CC version updated to match dario v3.30 live fingerprint capture
-const CC_VERSION = '2.1.114';
+// [dario] CC version updated to match dario v3.31.1 live fingerprint capture (2026-04-22)
+const CC_VERSION = '2.1.117';
 const BILLING_HASH_SALT = '59cf53e54c78';
 const BILLING_HASH_INDICES = [4, 7, 20];
 const DEVICE_ID = crypto.randomBytes(32).toString('hex');
