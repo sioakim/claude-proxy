@@ -43,7 +43,7 @@ const { StringDecoder } = require('string_decoder');
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.4.3';
+const VERSION = '2.5.0';
 const USAGE_FILE = path.join(__dirname, 'data', 'usage.json');
 
 // ─── Layer 8: Claude Code Identity & Billing ───────────────────────
@@ -126,6 +126,19 @@ function buildBillingBlock(firstUserMessage) {
     type: 'text',
     text: `x-anthropic-billing-header: cc_version=${CC_VERSION}.${fp}; cc_entrypoint=sdk-cli; cch=${cch};`
   };
+}
+
+// ─── OAuth URL Normalization (ported from dario/cc-oauth-detect.ts v3.31.3) ──
+// CC binary ships authorizeUrl as https://claude.com/cai/oauth/authorize but at
+// runtime CC v2.1.116+ opens https://claude.ai/oauth/authorize directly. The
+// claude.com URL recently started failing ("Invalid request format") after
+// Anthropic changed the 307 redirect validation. This normalizer rewrites the
+// legacy URL wherever it appears so our proxy matches CC's runtime behaviour.
+function normalizeAuthorizeUrl(url) {
+  if (url === 'https://claude.com/cai/oauth/authorize') {
+    return 'https://claude.ai/oauth/authorize';
+  }
+  return url;
 }
 
 // Stainless SDK helpers
@@ -1043,6 +1056,17 @@ function processBody(bodyStr, config) {
       parsed.context_management = { edits: [{ type: 'clear_thinking_20251015', keep: 'all' }] };
     }
 
+    // [dario v3.30.1+] CC 2.1.116+ pins max_tokens and output_config.effort
+    // for non-haiku models. Missing these fields is a fingerprint.
+    const modelLower = ((parsed.model || '')).toLowerCase();
+    const isHaiku = modelLower.includes('haiku');
+    if (!parsed.max_tokens) {
+      parsed.max_tokens = 32000;
+    }
+    if (hasThinking && !isHaiku && !parsed.output_config) {
+      parsed.output_config = { effort: 'high' };
+    }
+
     // Layer 8: Strip stale betas body field (API rejects it; betas are header-only)
     delete parsed.betas;
 
@@ -1840,6 +1864,12 @@ function startServer(config) {
               }
               if (parsed.error) {
                 console.error(`[DEBUG] #${reqNum} Error: ${parsed.error.type}: ${parsed.error.message}`);
+                // [dario v3.31.2] Verbose 401 logging — auth rejects are hard to
+                // diagnose without knowing which credential shape was sent.
+                if (upRes.statusCode === 401) {
+                  const tokenInfo = oauth ? `sub=${oauth.subscriptionType || 'unknown'}, expires=${new Date(oauth.expiresAt || 0).toISOString()}` : 'no-oauth';
+                  console.error(`[AUTH-REJECT] #${reqNum} 401 from upstream — ${tokenInfo}`);
+                }
               }
             } catch (e) { /* non-JSON or error response */ }
 
@@ -2021,4 +2051,6 @@ module.exports = {
   PACING_JITTER_MS,
   SESSION_ROTATION_IDLE_MS,
   SESSION_ROTATION_JITTER_MS,
+  // v2.5.0 exports (dario v3.30.1–v3.31.3 ports)
+  normalizeAuthorizeUrl,
 };

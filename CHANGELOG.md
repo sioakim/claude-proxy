@@ -1,5 +1,49 @@
 # Changelog
 
+## v2.5.0 -- 2026-04-23
+
+### dario v3.30.1–v3.31.3 upstream sync
+
+Ported relevant changes from dario v3.30.1 through v3.31.3. Only CC-relevant
+bug fixes and fingerprint updates were ported; CLI flags, bounded queue,
+Hermes/Cursor/Cline detection, and multi-client features were skipped
+(single-user proxy doesn't need them).
+
+**Ported:**
+
+1. **max_tokens pin (v3.30.1)** — CC 2.1.116+ sends `max_tokens: 32000` on
+   every request. Our proxy now injects this when the client doesn't set it,
+   closing a fingerprint gap where real CC always includes this field.
+
+2. **output_config.effort injection (v3.30.1/v3.31.1)** — CC 2.1.116+ sends
+   `output_config: { effort: 'high' }` for non-haiku thinking requests. Now
+   injected when missing from the client request.
+
+3. **Verbose 401 logging (v3.31.2, dario#97)** — When Anthropic returns 401,
+   the proxy now logs subscription type and token expiry to help diagnose auth
+   failures. Header values are never logged (only metadata).
+
+4. **OAuth authorize URL normalization (v3.31.3, dario#71)** — Added
+   `normalizeAuthorizeUrl()` that rewrites the legacy
+   `https://claude.com/cai/oauth/authorize` to `https://claude.ai/oauth/authorize`.
+   CC's binary ships the legacy URL but runtime uses claude.ai directly; recent
+   Anthropic-side changes broke the 307 redirect path.
+
+**Evaluated and skipped (not applicable to single-user proxy):**
+
+- v3.30.4: Platform-scoped tool filtering (PowerShell on Windows) — macOS only
+- v3.30.5: maxTested bump — internal to dario
+- v3.30.6: Tier-1 review feedback — docs only
+- v3.30.7: `--preserve-orchestration-tags` flag — not needed
+- v3.30.8: `--no-live-capture` + `--strict-template` flags — not needed
+- v3.30.9: Bounded request queue — single-user, no concurrency control needed
+- v3.30.10: `--effort` flag — we hardcode 'high' matching CC wire default
+- v3.30.13: Hermes Agent detection + max_tokens passthrough — OpenClaw only
+- v3.31.0: Stability policy — docs only
+- v3.31.1: CC 2.1.117 drift patch — already at 2.1.117 since v2.4.3
+
+---
+
 ## v2.4.0 -- 2026-04-20
 
 ### dario knowledge port — 10 fingerprint improvements
